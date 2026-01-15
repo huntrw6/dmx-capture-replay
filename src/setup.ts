@@ -183,7 +183,7 @@ export function displayDiscoveredNodes(nodes: ArtNetNode[]): void {
   }
 
   console.log(`\n--- Discovered Art-Net Nodes (${nodes.length}) ---`);
-  console.log(`    (Note: Universes shown as 1-based, Art-Net wire format is 0-based)`);
+  console.log(`    (Note: Universes shown as "1 (Art-Net 0)" to indicate display (wire) numbering)`);
   nodes.forEach((node, index) => {
     console.log(`\n  ${index + 1}. ${node.shortName || "Unknown"} (${node.ip})`);
     if (node.manufacturer) {
@@ -196,8 +196,7 @@ export function displayDiscoveredNodes(nodes: ArtNetNode[]): void {
       console.log(`     Firmware: ${node.firmwareVersion}`);
     }
     if (node.universes.length > 0) {
-      // Display as 1-indexed for user clarity (Art-Net wire format is 0-indexed)
-      console.log(`     Universes: ${node.universes.map((u) => u + 1).join(", ")}`);
+      console.log(`     Universes: ${node.universes.map((u) => formatUniverseForDisplay(u, "artnet")).join(", ")}`);
     }
   });
   console.log("\n-----------------------------------------\n");
@@ -225,8 +224,7 @@ export async function promptNodeSelection(nodes: ArtNetNode[], hasNewNodes: bool
 
   // Add node choices first
   nodes.forEach((node, index) => {
-    // Display universes as 1-indexed for user clarity (Art-Net wire format is 0-indexed)
-    const universeStr = node.universes.length > 0 ? ` [Universes: ${node.universes.map((u) => u + 1).join(", ")}]` : "";
+    const universeStr = node.universes.length > 0 ? ` [Universes: ${node.universes.map((u) => formatUniverseForDisplay(u, "artnet")).join(", ")}]` : "";
     choices.push({
       name: `${node.shortName || "Unknown"} (${node.ip})${universeStr}`,
       value: index,

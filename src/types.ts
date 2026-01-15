@@ -197,11 +197,12 @@ export function isValidSACNUniverse(universe: unknown): universe is UniverseNumb
 }
 
 /**
- * Convert universe number to display format (1-indexed for user display)
- * Art-Net uses 0-indexed internally, sACN uses 1-indexed
+ * Convert universe number to display format for UI/log output.
+ * - Art-Net uses 0-indexed on wire/internal, but is commonly displayed as 1-based.
+ * - sACN universes are 1-based on wire/internal.
  */
-export function formatUniverseForDisplay(universe: number, protocol: Protocol): number {
-  return protocol === "artnet" ? universe + 1 : universe;
+export function formatUniverseForDisplay(universe: number, protocol: Protocol): string {
+  return protocol === "artnet" ? `${universe + 1} (Art-Net ${universe})` : `${universe}`;
 }
 
 /** Validate IP address format */

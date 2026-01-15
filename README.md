@@ -198,6 +198,7 @@ The monitor displays a 32x16 grid representing DMX channels 1-512:
 - Default port: 6454
 - Supports broadcast mode
 - Universe range: 0-32767
+- Universe display: shown as `1 (Art-Net 0)` (display number and wire number)
 
 ## Requirements
 

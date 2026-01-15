@@ -549,7 +549,7 @@ export class DisplayManager {
 
     if (this.layoutMode === "hidden") {
       // Include basic stats in footer when stats panel is hidden
-      // Convert universe to 1-indexed display format for Art-Net
+      // Convert universe to user-facing display format
       const displayUniverse = formatUniverseForDisplay(this.stats.universe, this.stats.protocol);
       const pps = this.stats.packetsPerSecond.toFixed(0);
       return ` {bold}Q{/bold}: Quit | ${recText} | {bold}C{/bold}: Clear | {bold}V{/bold}: Toggle (${modeText}) | Pkts: ${this.stats.packetsReceived} | ${pps}/s | U:${displayUniverse} `;
@@ -1109,7 +1109,7 @@ export class DisplayManager {
       }
     }
 
-    // Convert universe to 1-indexed display format for Art-Net
+    // Convert universe to user-facing display format
     const displayUniverse = formatUniverseForDisplay(this.stats.universe, this.stats.protocol);
     
     this.statsBox.setContent(
@@ -1188,7 +1188,7 @@ export class DisplayManager {
     const loopText = info.loopEnabled ? "{green-fg}ON{/green-fg}" : "OFF";
     const speedText = info.speed === 1.0 ? "1.0x" : `${info.speed.toFixed(2)}x`;
 
-    // Convert universe to 1-indexed display format for Art-Net
+    // Convert universe to user-facing display format
     const displayUniverse = formatUniverseForDisplay(info.universe, info.protocol as Protocol);
     
     this.statsBox.setContent(
@@ -1227,14 +1227,24 @@ export class DisplayManager {
           let stateIcon = "⏹";
           if (info.state === "playing") stateIcon = "▶";
           else if (info.state === "paused") stateIcon = "⏸";
-          // Convert universe to 1-indexed display format for Art-Net
+          // Convert universe to user-facing display format
           const displayUniverse = formatUniverseForDisplay(info.universe, info.protocol as Protocol);
-          this.headerBox.setContent(` ${this.config.title} - PLAYBACK ${stateIcon} - Universe ${displayUniverse} (${info.protocol.toUpperCase()}) `);
+          if (info.protocol === "artnet") {
+            // Avoid `... (Art-Net 0) (ARTNET)` duplication for Art-Net
+            this.headerBox.setContent(` ${this.config.title} - PLAYBACK ${stateIcon} - Universe ${displayUniverse} `);
+          } else {
+            this.headerBox.setContent(` ${this.config.title} - PLAYBACK ${stateIcon} - Universe ${displayUniverse} (${info.protocol.toUpperCase()}) `);
+          }
         } else {
           const recIndicator = this._recordingState === "recording" ? " {red-fg}● REC{/red-fg}" : "";
-          // Convert universe to 1-indexed display format for Art-Net
+          // Convert universe to user-facing display format
           const displayUniverse = formatUniverseForDisplay(this.stats.universe, this.stats.protocol);
-          this.headerBox.setContent(` ${this.config.title} - Universe ${displayUniverse} (${this.stats.protocol.toUpperCase()})${recIndicator} `);
+          if (this.stats.protocol === "artnet") {
+            // Avoid `... (Art-Net 0) (ARTNET)` duplication for Art-Net
+            this.headerBox.setContent(` ${this.config.title} - Universe ${displayUniverse}${recIndicator} `);
+          } else {
+            this.headerBox.setContent(` ${this.config.title} - Universe ${displayUniverse} (${this.stats.protocol.toUpperCase()})${recIndicator} `);
+          }
         }
       }
 

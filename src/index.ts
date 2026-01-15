@@ -387,7 +387,7 @@ class DMXMonitorApp {
       return;
     }
 
-    // Log with 1-indexed universe for user clarity (Art-Net uses 0-indexed internally)
+    // Log with user-facing universe display
     const displayUniverse = formatUniverseForDisplay(selectedUniverse, this.currentProtocol);
     logInfo(`Listening for packets on universe ${displayUniverse}`);
 
