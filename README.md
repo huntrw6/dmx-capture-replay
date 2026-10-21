@@ -56,3 +56,7 @@ node dist/index.js --playback rec.dmxrec --map 1=11,2=12
 | `+` `-` | Speed |
 | `←` `→` | Seek 5 seconds |
 | `Q` | Quit |
+
+## License
+
+[GPL-3.0](LICENCE). Dependencies are MIT or Apache-2.0, which are compatible.
