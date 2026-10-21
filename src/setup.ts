@@ -4,7 +4,7 @@
 
 import inquirer from 'inquirer';
 import os from 'os';
-import { Protocol, NetworkInterface, CLIOptions, MonitorConfig, ArtNetNode, isValidIPv4, isValidUniverse, formatUniverseForDisplay } from "./types";
+import { Protocol, NetworkInterface, CLIOptions, MonitorConfig, ArtNetNode, isValidIPv4, isValidArtNetUniverse, isValidSACNUniverse, formatUniverseForDisplay, parseUniverseList } from "./types";
 import { ConfigError, NetworkError } from "./errors";
 import { logDebug, logInfo } from "./logger";
 
@@ -142,35 +142,34 @@ async function promptBroadcast(): Promise<boolean> {
 /**
  * Prompt for universe selection from discovered universes
  */
-export async function promptUniverseSelection(universes: number[]): Promise<number> {
+export async function promptUniverseSelection(universes: number[]): Promise<number[]> {
   if (universes.length === 0) {
     throw ConfigError.missingRequired("universe");
   }
 
   if (universes.length === 1) {
-    const universe = universes[0];
-    if (universe === undefined) {
-      throw ConfigError.missingRequired("universe");
-    }
-    logInfo(`Auto-selecting only detected universe: ${universe}`);
-    return universe;
+    logInfo(`Auto-selecting only detected universe: ${universes[0]}`);
+    return universes.slice();
   }
 
-  const { universe } = await inquirer.prompt<{ universe: number }>([
+  const { selected } = await inquirer.prompt<{ selected: number[] }>([
     {
-      type: "list",
-      name: "universe",
-      message: `Multiple universes detected (${universes.length}). Select universe to monitor:`,
+      type: "checkbox",
+      name: "selected",
+      message: `Multiple universes detected (${universes.length}). Select universe(s) to monitor (space to toggle):`,
       choices: universes
+        .slice()
         .sort((a, b) => a - b)
         .map((u) => ({
           name: `Universe ${u}`,
           value: u,
+          checked: true,
         })),
+      validate: (input: unknown) => (Array.isArray(input) && input.length > 0) || "Select at least one universe",
     },
   ]);
 
-  return universe;
+  return selected;
 }
 
 /**
@@ -266,7 +265,7 @@ export async function promptNodeSelection(nodes: ArtNetNode[], hasNewNodes: bool
 /**
  * Prompt for universe selection from a specific node
  */
-export async function promptUniverseFromNode(node: ArtNetNode): Promise<number | null> {
+export async function promptUniverseFromNode(node: ArtNetNode): Promise<number[] | null> {
   if (node.universes.length === 0) {
     console.log(`Node ${node.shortName} has no universes configured.`);
     return null;
@@ -277,25 +276,27 @@ export async function promptUniverseFromNode(node: ArtNetNode): Promise<number |
     if (universe !== undefined) {
       // Display as 1-indexed, return 0-indexed wire value
       console.log(`Auto-selecting universe ${universe + 1} from ${node.shortName}`);
-      return universe;
+      return [universe];
     }
     return null;
   }
 
-  const { universe } = await inquirer.prompt<{ universe: number }>([
+  const { universes } = await inquirer.prompt<{ universes: number[] }>([
     {
-      type: "list",
-      name: "universe",
-      message: `Select universe from ${node.shortName}:`,
+      type: "checkbox",
+      name: "universes",
+      message: `Select universe(s) from ${node.shortName} (space to toggle, enter to confirm):`,
       // Display as 1-indexed for user, but value is 0-indexed wire format
       choices: node.universes.map((u) => ({
         name: `Universe ${u + 1}`,
         value: u,
+        checked: true,
       })),
+      validate: (input: unknown) => (Array.isArray(input) && input.length > 0) || "Select at least one universe",
     },
   ]);
 
-  return universe;
+  return universes;
 }
 
 /**
@@ -303,57 +304,79 @@ export async function promptUniverseFromNode(node: ArtNetNode): Promise<number |
  * User enters 1-indexed universe (1-32768), returns 0-indexed for Art-Net wire format
  * Art-Net supports 32,768 universes (0-32767 on wire)
  */
-export async function promptManualUniverse(): Promise<number> {
+export async function promptManualUniverse(): Promise<number[]> {
   // Show note about universe numbering
-  console.log("    (Note: Enter 1-based universe. Art-Net wire format is 0-based, e.g. Universe 1 = 0 on wire)");
+  console.log("    (Note: Enter 1-based universes. Art-Net wire format is 0-based, e.g. Universe 1 = 0 on wire)");
+  console.log("    (Several universes: 1,2,5 or ranges like 1-4)");
 
-  const { universe } = await inquirer.prompt<{ universe: number }>([
+  const { universes } = await inquirer.prompt<{ universes: number[] }>([
     {
       type: "input",
-      name: "universe",
-      message: "Enter Art-Net universe number to monitor (1-32768):",
+      name: "universes",
+      message: "Enter Art-Net universe number(s) to monitor (1-32768):",
       default: "1",
       validate: (input: string) => {
-        const num = parseInt(input, 10);
-        if (isNaN(num) || num < 1 || num > 32768) {
-          return "Please enter a valid Art-Net universe number (1-32768)";
+        try {
+          const list = parseUniverseList(input);
+          if (list.some((n) => n < 1 || n > 32768)) {
+            return "Art-Net universes must be between 1 and 32768";
+          }
+          return true;
+        } catch (error) {
+          return error instanceof Error ? error.message : "Invalid universe list";
         }
-        return true;
       },
-      filter: (input: string) => parseInt(input, 10),
+      filter: (input: string) => {
+        try {
+          return parseUniverseList(input);
+        } catch {
+          return input;
+        }
+      },
     },
   ]);
 
   // Convert user's 1-indexed input to 0-indexed Art-Net wire format
-  return universe - 1;
+  return universes.map((u) => u - 1);
 }
 
 /**
  * Prompt for sACN universe entry
  * sACN uses 1-indexed universes (1-63999)
  */
-export async function promptSACNUniverse(): Promise<number> {
+export async function promptSACNUniverse(): Promise<number[]> {
   // Show note about universe numbering (sACN is natively 1-based)
   console.log("    (Note: sACN universes are 1-based, matching the wire format)");
+  console.log("    (Several universes: 1,2,5 or ranges like 1-4)");
 
-  const { universe } = await inquirer.prompt<{ universe: number }>([
+  const { universes } = await inquirer.prompt<{ universes: number[] }>([
     {
       type: "input",
-      name: "universe",
-      message: "Enter sACN universe to monitor (1-63999):",
+      name: "universes",
+      message: "Enter sACN universe(s) to monitor (1-63999):",
       default: "1",
       validate: (input: string) => {
-        const num = parseInt(input, 10);
-        if (isNaN(num) || num < 1 || num > 63999) {
-          return "Please enter a valid universe number (1-63999)";
+        try {
+          const list = parseUniverseList(input);
+          if (list.some((n) => n < 1 || n > 63999)) {
+            return "sACN universes must be between 1 and 63999";
+          }
+          return true;
+        } catch (error) {
+          return error instanceof Error ? error.message : "Invalid universe list";
         }
-        return true;
       },
-      filter: (input: string) => parseInt(input, 10),
+      filter: (input: string) => {
+        try {
+          return parseUniverseList(input);
+        } catch {
+          return input;
+        }
+      },
     },
   ]);
 
-  return universe;
+  return universes;
 }
 
 /**
@@ -368,8 +391,24 @@ function validateCLIOptions(options: CLIOptions): void {
     throw ConfigError.invalidOption("address", options.address, "must be a valid IPv4 address");
   }
 
-  if (options.universe !== undefined && !isValidUniverse(options.universe)) {
-    throw ConfigError.invalidOption("universe", options.universe, "must be a valid universe number (Art-Net: 0-32767, sACN: 1-63999)");
+  if (options.universes !== undefined) {
+    if (options.universes.length === 0) {
+      throw ConfigError.invalidOption("universe", "", "give at least one universe");
+    }
+    for (const u of options.universes) {
+      // Without a protocol on the CLI yet, accept the union of both ranges;
+      // the protocol-specific check runs once the protocol is known.
+      const ok = options.protocol === "artnet" ? isValidArtNetUniverse(u)
+        : options.protocol === "sacn" ? isValidSACNUniverse(u)
+        : isValidArtNetUniverse(u) || isValidSACNUniverse(u);
+      if (!ok) {
+        throw ConfigError.invalidOption("universe", u, "must be a valid universe number (Art-Net: 0-32767, sACN: 1-63999)");
+      }
+    }
+  }
+
+  if (options.allUniverses && options.protocol === "sacn") {
+    throw ConfigError.invalidOption("all-universes", "", "is only supported for Art-Net (sACN needs the universes listed so multicast groups can be joined)");
   }
 }
 
@@ -389,7 +428,7 @@ export function hasAllRequiredOptions(cliOptions: CLIOptions): boolean {
   // For Art-Net: broadcast defaults to true if not specified
   const hasProtocol = !!cliOptions.protocol;
   const hasAddress = !!(cliOptions.address || cliOptions.interface);
-  const hasUniverse = cliOptions.universe !== undefined;
+  const hasUniverse = cliOptions.universes !== undefined || cliOptions.allUniverses === true;
 
   return hasProtocol && hasAddress && hasUniverse;
 }
@@ -482,7 +521,8 @@ export async function runSetup(cliOptions: CLIOptions): Promise<MonitorConfig> {
     netmask,
     useMulticast,
     useBroadcast,
-    selectedUniverse: cliOptions.universe,
+    selectedUniverses: cliOptions.universes ?? [],
+    allUniverses: cliOptions.allUniverses ?? false,
     verbose: cliOptions.verbose ?? false,
     logFile: cliOptions.logFile,
   };
@@ -506,10 +546,12 @@ export async function confirmStart(config: MonitorConfig): Promise<boolean> {
     console.log(`Broadcast: ${config.useBroadcast ? "Yes" : "No"}`);
   }
 
-  if (config.selectedUniverse !== undefined) {
-    // Display universe in 1-based format
-    const displayUniverse = formatUniverseForDisplay(config.selectedUniverse, config.protocol);
-    console.log(`Universe:  ${displayUniverse}`);
+  if (config.allUniverses) {
+    console.log(`Universe:  All (every universe seen)`);
+  } else if (config.selectedUniverses.length > 0) {
+    // Display universes in 1-based format
+    const list = config.selectedUniverses.map((u) => formatUniverseForDisplay(u, config.protocol)).join(", ");
+    console.log(`Universe${config.selectedUniverses.length > 1 ? "s" : ""}: ${list}`);
   } else {
     console.log(`Universe:  Auto-detect`);
   }

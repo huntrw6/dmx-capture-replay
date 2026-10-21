@@ -3,6 +3,12 @@
  * 
  * Highly optimized binary format for recording DMX data with delta compression.
  * Only stores channel changes with precision timestamps for minimal file size.
+ *
+ * File format v2 (multi-universe): every frame is
+ *   varint deltaTime | uint16 LE universe | count byte | payload
+ * where deltaTime is relative to the previous frame of ANY universe, so the
+ * relative timing between universes is preserved. v1 files (single universe,
+ * no per-frame universe field) can still be played back.
  */
 
 import * as fs from 'fs';
@@ -75,8 +81,14 @@ function formatDateForFilename(date: Date): string {
   return `${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())}-${pad(date.getHours())}${pad(date.getMinutes())}${pad(date.getSeconds())}`;
 }
 
+/** Per-universe recorder state */
+interface UniverseRecordState {
+  previous: Uint8Array;
+  lastSnapshotTime: number;
+}
+
 /**
- * DMX Recorder - Records DMX data to an optimized binary format
+ * DMX Recorder - Records DMX data (one or many universes) to an optimized binary format
  */
 export class DMXRecorder {
   private state: RecordingState = 'idle';
@@ -84,29 +96,26 @@ export class DMXRecorder {
   private fileHandle: number | null = null;
   private writeBuffer: Buffer;
   private writeOffset = 0;
-  
-  private previousChannels: Uint8Array;
+
+  private universeState: Map<number, UniverseRecordState> = new Map();
   private startTime: number = 0;
   private lastFrameTime: number = 0;
-  private lastSnapshotTime: number = 0;
   private frameCount = 0;
   private bytesWritten = 0;
-  
+
   private protocol: Protocol = 'sacn';
-  private universe: number = 1;
-  
+
   constructor() {
-    this.previousChannels = new Uint8Array(TOTAL_CHANNELS);
     this.writeBuffer = Buffer.alloc(WRITE_BUFFER_SIZE);
   }
-  
+
   /**
    * Get current recording state
    */
   getState(): RecordingState {
     return this.state;
   }
-  
+
   /**
    * Get recording statistics
    */
@@ -120,54 +129,60 @@ export class DMXRecorder {
       duration: this.state === "recording" ? Date.now() - this.startTime : 0,
     };
   }
-  
+
+  /**
+   * Universes that have been written to the current/last recording (sorted)
+   */
+  getRecordedUniverses(): number[] {
+    return Array.from(this.universeState.keys()).sort((a, b) => a - b);
+  }
+
   /**
    * Check if currently recording
    */
   isRecording(): boolean {
     return this.state === "recording";
   }
-  
+
   /**
-   * Start recording to a new file
+   * Start recording to a new file. Universes are added to the file as their
+   * first frame arrives, so the caller decides which universes to feed in.
    */
-  startRecording(protocol: Protocol, universe: number, outputDir?: string): string {
+  startRecording(protocol: Protocol, outputDir?: string): string {
     if (this.state === "recording") {
       throw new Error("Already recording");
     }
-    
+
     this.protocol = protocol;
-    this.universe = universe;
-    
+
     // Generate filename
     const timestamp = formatDateForFilename(new Date());
     const filename = `dmx-recording-${timestamp}.dmxrec`;
     const dir = outputDir || process.cwd();
     this.filePath = path.join(dir, filename);
-    
+
     // Open file for writing (binary mode)
     this.fileHandle = fs.openSync(this.filePath, 'w');
-    
-    // Write initial header with magic bytes (will be updated on stop with final values)
+
+    // Write initial header (will be rewritten on stop with final values)
     const headerBuffer = this.createHeader(0);
     fs.writeSync(this.fileHandle, headerBuffer);
     this.bytesWritten = HEADER_SIZE;
-    
+
     // Reset state
-    this.previousChannels.fill(0);
+    this.universeState.clear();
     this.startTime = Date.now();
     this.lastFrameTime = this.startTime;
-    this.lastSnapshotTime = this.startTime;
     this.frameCount = 0;
     this.writeOffset = 0;
-    
+
     this.state = "recording";
-    
-    logInfo("Recording started", { filePath: this.filePath, protocol, universe });
-    
+
+    logInfo("Recording started", { filePath: this.filePath, protocol });
+
     return this.filePath;
   }
-  
+
   /**
    * Stop recording and finalize the file
    */
@@ -175,13 +190,13 @@ export class DMXRecorder {
     if (this.state !== "recording") {
       throw new Error("Not recording");
     }
-    
+
     // Flush any remaining buffer
     this.flushBuffer();
-    
+
     // Calculate final duration
     const duration = Date.now() - this.startTime;
-    
+
     // Write final header
     if (this.fileHandle !== null) {
       const header = this.createHeader(duration);
@@ -190,76 +205,83 @@ export class DMXRecorder {
       fs.closeSync(this.fileHandle);
       this.fileHandle = null;
     }
-    
+
     const stats = this.getStats();
     stats.duration = duration;
-    
+
     this.state = "idle";
-    
+
     logInfo("Recording stopped", {
       filePath: this.filePath,
       duration,
       frameCount: this.frameCount,
       bytesWritten: this.bytesWritten,
+      universes: this.getRecordedUniverses(),
     });
-    
+
     return stats;
   }
-  
+
   /**
-   * Record a frame of DMX data
-   * Only stores changes from the previous frame
+   * Record a frame of DMX data for one universe.
+   * Only stores changes from the previous frame of that universe.
    */
-  recordFrame(channels: Uint8Array): void {
+  recordFrame(universe: number, channels: Uint8Array): void {
     if (this.state !== "recording") return;
-    
+
     const now = Date.now();
     const isFirstFrame = this.frameCount === 0;
-    
+
     // First frame always has deltaTime = 0 (starts immediately on playback)
     const deltaTime = isFirstFrame ? 0 : (now - this.lastFrameTime);
-    
-    // Check if we need a full snapshot (first frame or periodic)
-    const needsSnapshot = isFirstFrame || (now - this.lastSnapshotTime) >= SNAPSHOT_INTERVAL;
-    
+
+    let uState = this.universeState.get(universe);
+    const isNewUniverse = !uState;
+    if (!uState) {
+      uState = { previous: new Uint8Array(TOTAL_CHANNELS), lastSnapshotTime: now };
+      this.universeState.set(universe, uState);
+    }
+
+    // Full snapshot for a universe's first frame, then periodically
+    const needsSnapshot = isNewUniverse || (now - uState.lastSnapshotTime) >= SNAPSHOT_INTERVAL;
+
     if (needsSnapshot) {
-      this.writeSnapshotFrame(channels, deltaTime);
-      this.lastSnapshotTime = now;
-      // Update state
-      this.previousChannels.set(channels);
+      this.writeSnapshotFrame(universe, channels, deltaTime);
+      uState.lastSnapshotTime = now;
+      uState.previous.fill(0);
+      uState.previous.set(channels.subarray(0, TOTAL_CHANNELS));
       this.lastFrameTime = now;
       this.frameCount++;
-    } else {
-      // Compute delta changes
-      const changes: ChannelChange[] = [];
-      for (let i = 0; i < TOTAL_CHANNELS; i++) {
-        const newValue = channels[i] ?? 0;
-        const oldValue = this.previousChannels[i] ?? 0;
-        if (newValue !== oldValue) {
-          changes.push({ channel: i, value: newValue });
-        }
+      return;
+    }
+
+    // Compute delta changes
+    const changes: ChannelChange[] = [];
+    for (let i = 0; i < TOTAL_CHANNELS; i++) {
+      const newValue = channels[i] ?? 0;
+      const oldValue = uState.previous[i] ?? 0;
+      if (newValue !== oldValue) {
+        changes.push({ channel: i, value: newValue });
       }
-      
-      // Only write if there are changes
-      if (changes.length > 0) {
-        this.writeDeltaFrame(changes, deltaTime);
-        // Update state
-        this.previousChannels.set(channels);
-        this.lastFrameTime = now;
-        this.frameCount++;
-      }
-      // No changes = no frame written, don't update state
+    }
+
+    // Only write if there are changes (no changes = no frame, timing state untouched)
+    if (changes.length > 0) {
+      this.writeDeltaFrame(universe, changes, deltaTime);
+      uState.previous.fill(0);
+      uState.previous.set(channels.subarray(0, TOTAL_CHANNELS));
+      this.lastFrameTime = now;
+      this.frameCount++;
     }
   }
-  
+
   /**
    * Write a delta frame to the buffer
    */
-  private writeDeltaFrame(changes: ChannelChange[], deltaTime: number): void {
-    // Encode delta time as varint
-    const deltaBuffer = encodeVarint(deltaTime);
-    this.appendToBuffer(deltaBuffer);
-    
+  private writeDeltaFrame(universe: number, changes: ChannelChange[], deltaTime: number): void {
+    this.appendToBuffer(encodeVarint(deltaTime));
+    this.appendUint16(universe);
+
     // Write change count
     if (changes.length < FrameType.SNAPSHOT) {
       this.appendByte(changes.length);
@@ -268,31 +290,32 @@ export class DMXRecorder {
       this.appendByte(FrameType.EXTENDED);
       this.appendUint16(changes.length);
     }
-    
+
     // Write each change
     for (const change of changes) {
       this.appendUint16(change.channel);
       this.appendByte(change.value);
     }
   }
-  
+
   /**
    * Write a full snapshot frame
    */
-  private writeSnapshotFrame(channels: Uint8Array, deltaTime: number): void {
-    // Encode delta time as varint
-    const deltaBuffer = encodeVarint(deltaTime);
-    this.appendToBuffer(deltaBuffer);
-    
+  private writeSnapshotFrame(universe: number, channels: Uint8Array, deltaTime: number): void {
+    this.appendToBuffer(encodeVarint(deltaTime));
+    this.appendUint16(universe);
+
     // Write snapshot marker
     this.appendByte(FrameType.SNAPSHOT);
-    
-    // Write all 512 channel values
-    this.appendToBuffer(Buffer.from(channels.slice(0, TOTAL_CHANNELS)));
-    
-    logDebug('Wrote snapshot frame', { deltaTime, frameCount: this.frameCount });
+
+    // Write all 512 channel values (pad short input with zeros)
+    const snapshot = Buffer.alloc(TOTAL_CHANNELS);
+    snapshot.set(channels.subarray(0, TOTAL_CHANNELS));
+    this.appendToBuffer(snapshot);
+
+    logDebug('Wrote snapshot frame', { universe, deltaTime, frameCount: this.frameCount });
   }
-  
+
   /**
    * Append a single byte to the write buffer
    */
@@ -302,7 +325,7 @@ export class DMXRecorder {
     }
     this.writeBuffer[this.writeOffset++] = value;
   }
-  
+
   /**
    * Append a uint16 (little-endian) to the write buffer
    */
@@ -313,7 +336,7 @@ export class DMXRecorder {
     this.writeBuffer.writeUInt16LE(value, this.writeOffset);
     this.writeOffset += 2;
   }
-  
+
   /**
    * Append a buffer to the write buffer
    */
@@ -321,7 +344,7 @@ export class DMXRecorder {
     if (this.writeOffset + data.length >= this.writeBuffer.length) {
       this.flushBuffer();
     }
-    
+
     // If data is larger than buffer, write directly
     if (data.length >= this.writeBuffer.length) {
       if (this.fileHandle !== null) {
@@ -330,11 +353,11 @@ export class DMXRecorder {
       }
       return;
     }
-    
+
     data.copy(this.writeBuffer, this.writeOffset);
     this.writeOffset += data.length;
   }
-  
+
   /**
    * Flush the write buffer to disk
    */
@@ -345,45 +368,49 @@ export class DMXRecorder {
       this.writeOffset = 0;
     }
   }
-  
+
   /**
    * Create the file header buffer
    */
   private createHeader(duration: number): Buffer {
     const header = Buffer.alloc(HEADER_SIZE);
     let offset = 0;
-    
+
     // Magic bytes (4 bytes)
     header.write(DMXREC_MAGIC, offset, 'ascii');
     offset += 4;
-    
+
     // Version (1 byte)
     header.writeUInt8(DMXREC_VERSION, offset++);
-    
+
     // Flags (1 byte)
     header.writeUInt8(RecordingFlags.HAS_SNAPSHOTS, offset++);
-    
+
     // Protocol (1 byte) - 0=sACN, 1=Art-Net
     header.writeUInt8(this.protocol === 'sacn' ? 0 : 1, offset++);
-    
-    // Universe (2 bytes)
-    header.writeUInt16LE(this.universe, offset);
+
+    // First (lowest) universe (2 bytes) - kept for v1 compatibility
+    const universes = this.getRecordedUniverses();
+    header.writeUInt16LE(universes[0] ?? 0, offset);
     offset += 2;
-    
+
     // Start timestamp (8 bytes)
     header.writeBigInt64LE(BigInt(this.startTime), offset);
     offset += 8;
-    
+
     // Duration (4 bytes)
     header.writeUInt32LE(duration, offset);
     offset += 4;
-    
+
     // Frame count (4 bytes)
     header.writeUInt32LE(this.frameCount, offset);
     offset += 4;
-    
-    // Reserved (7 bytes) - already zeroed
-    
+
+    // Universe count (2 bytes) - v2
+    header.writeUInt16LE(universes.length, offset);
+
+    // Remaining reserved bytes already zeroed
+
     return header;
   }
 }
@@ -391,17 +418,13 @@ export class DMXRecorder {
 /** Speed presets for playback */
 const SPEED_PRESETS = [0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 4.0];
 
-/** Frame index entry for seeking */
-interface FrameIndex {
-  offset: number;
-  position: number;
-  isSnapshot: boolean;
-}
+/** Callback signature for player frames */
+export type PlayerFrameCallback = (universe: number, channels: Uint8Array) => void;
 
 /**
- * DMX Player - Plays back recorded DMX data
- * 
- * Enhanced with speed control, seeking, and loop support.
+ * DMX Player - Plays back recorded DMX data (one or many universes)
+ *
+ * Supports speed control, seeking, loop and pause/resume.
  */
 export class DMXPlayer {
   private state: PlaybackState = "idle";
@@ -409,38 +432,38 @@ export class DMXPlayer {
   private header: RecordingHeader | null = null;
   private frameData: Buffer | null = null;
   private frameOffset = 0;
-  
-  private channels: Uint8Array;
+
+  /** Universes found in the file (sorted) and totals from a full scan */
+  private universes: number[] = [];
+  private totalFrames = 0;
+  private totalDuration = 0;
+
+  /** Current channel state per universe */
+  private channels: Map<number, Uint8Array> = new Map();
   private currentFrame = 0;
   private playbackStartTime = 0;
   private currentPosition = 0;
   private pausedPosition = 0;
-  
+
   // Speed and loop control
   private speed = 1.0;
   private loopEnabled = false;
-  
-  // Frame index for seeking (built lazily)
-  private frameIndex: FrameIndex[] = [];
-  private frameIndexBuilt = false;
-  
+
   private playbackTimer: NodeJS.Timeout | null = null;
-  private onFrameCallback: ((channels: Uint8Array) => void) | null = null;
+  /** Frame that has been read from the file but not yet applied (timer pending) */
+  private pending: { startOffset: number; deltaTime: number } | null = null;
+  private onFrameCallback: PlayerFrameCallback | null = null;
   private onFinishedCallback: (() => void) | null = null;
   private onPositionCallback: ((position: number, duration: number) => void) | null = null;
   private onStateChangeCallback: ((state: PlaybackState) => void) | null = null;
-  
-  constructor() {
-    this.channels = new Uint8Array(TOTAL_CHANNELS);
-  }
-  
+
   /**
    * Get current playback state
    */
   getState(): PlaybackState {
     return this.state;
   }
-  
+
   /**
    * Get playback statistics
    */
@@ -448,41 +471,71 @@ export class DMXPlayer {
     return {
       state: this.state,
       position: this.currentPosition,
-      duration: this.header?.duration ?? 0,
+      duration: this.totalDuration,
       frameIndex: this.currentFrame,
-      totalFrames: this.header?.frameCount ?? 0,
+      totalFrames: this.totalFrames,
       filePath: this.filePath,
     };
   }
-  
+
   /**
    * Get the recording header info
    */
   getHeader(): RecordingHeader | null {
     return this.header;
   }
-  
+
+  /**
+   * Universes contained in the loaded recording (sorted)
+   */
+  getUniverses(): number[] {
+    return this.universes.slice();
+  }
+
+  /**
+   * Total duration of the loaded recording in ms
+   */
+  getDuration(): number {
+    return this.totalDuration;
+  }
+
+  /**
+   * Total frames in the loaded recording
+   */
+  getTotalFrames(): number {
+    return this.totalFrames;
+  }
+
+  /**
+   * Restrict playback to a subset of the recorded universes.
+   * Frames for other universes are skipped (timing is unaffected).
+   */
+  private universeFilter: Set<number> | null = null;
+  setUniverseFilter(universes: number[] | null): void {
+    this.universeFilter = universes ? new Set(universes) : null;
+  }
+
   /**
    * Get current playback speed
    */
   getSpeed(): number {
     return this.speed;
   }
-  
+
   /**
    * Get loop enabled status
    */
   isLoopEnabled(): boolean {
     return this.loopEnabled;
   }
-  
+
   /**
-   * Get current channel data
+   * Get current channel data for a universe
    */
-  getChannels(): Uint8Array {
-    return this.channels;
+  getChannels(universe: number): Uint8Array {
+    return this.channels.get(universe) ?? new Uint8Array(TOTAL_CHANNELS);
   }
-  
+
   /**
    * Load a recording file for playback
    */
@@ -490,93 +543,70 @@ export class DMXPlayer {
     if (this.state === "playing") {
       this.stop();
     }
-    
+
     this.filePath = filePath;
-    
+
     // Read entire file into memory
     const fileBuffer = fs.readFileSync(filePath);
-    
+
     // Parse header
     this.header = this.parseHeader(fileBuffer);
-    
+
     // Store frame data (everything after header)
     this.frameData = fileBuffer.subarray(HEADER_SIZE);
     this.frameOffset = 0;
-    
-    // Clear frame index (will be built lazily on first seek)
-    this.frameIndex = [];
-    this.frameIndexBuilt = false;
-    
+
+    // Scan the whole file once: universes, real frame count and duration.
+    // This also makes playback work for recordings whose header was never
+    // finalised (e.g. the recorder was killed).
+    this.scan();
+
     // Reset state
-    this.channels.fill(0);
+    this.channels.clear();
     this.currentFrame = 0;
     this.currentPosition = 0;
-    
+    this.pausedPosition = 0;
+    this.pending = null;
+
     this.state = "idle";
-    
+
     logInfo("Recording loaded", {
       filePath,
-      duration: this.header.duration,
-      frameCount: this.header.frameCount,
+      version: this.header.version,
+      duration: this.totalDuration,
+      frameCount: this.totalFrames,
+      universes: this.universes,
     });
-    
+
     return this.header;
   }
-  
+
   /**
-   * Build frame index for seeking (only indexes snapshots for efficiency)
-   * Called lazily on first seek operation
+   * Walk the frame stream to collect universes, frame count and duration
    */
-  private buildFrameIndex(): void {
-    if (!this.frameData || this.frameIndexBuilt) return;
-    
-    const startTime = Date.now();
-    this.frameIndex = [];
-    let offset = 0;
+  private scan(): void {
+    const found = new Set<number>();
+    let frames = 0;
     let position = 0;
-    
-    while (offset < this.frameData.length) {
-      const frameStart = offset;
-      
-      // Read delta time (varint)
-      const { value: deltaTime, bytesRead: deltaBytes } = decodeVarint(this.frameData, offset);
-      offset += deltaBytes;
-      
-      // Read change count
-      const changeCount = this.frameData[offset++];
-      if (changeCount === undefined) break;
-      
-      const isSnapshot = changeCount === FrameType.SNAPSHOT;
-      
-      // Only index snapshot frames (needed for seeking)
-      if (isSnapshot) {
-        this.frameIndex.push({
-          offset: frameStart,
-          position,
-          isSnapshot: true,
-        });
+    this.frameOffset = 0;
+    try {
+      for (;;) {
+        const frame = this.readNextFrame();
+        if (!frame) break;
+        position += frame.deltaTime;
+        frames++;
+        found.add(frame.universe);
       }
-      
-      position += deltaTime;
-      
-      // Skip frame data
-      if (isSnapshot) {
-        offset += TOTAL_CHANNELS;
-      } else {
-        let actualChangeCount = changeCount;
-        if (changeCount === FrameType.EXTENDED) {
-          actualChangeCount = this.frameData.readUInt16LE(offset);
-          offset += 2;
-        }
-        // Skip changes (3 bytes each: 2 for channel, 1 for value)
-        offset += actualChangeCount * 3;
-      }
+    } catch (error) {
+      // Truncated final frame (unfinalised recording) - keep what we have
+      logDebug("Recording scan stopped at truncated frame", { error: String(error) });
     }
-    
-    this.frameIndexBuilt = true;
-    logDebug("Frame index built", { snapshots: this.frameIndex.length, timeMs: Date.now() - startTime });
+    this.frameOffset = 0;
+    this.universes = Array.from(found).sort((a, b) => a - b);
+    this.totalFrames = frames;
+    this.totalDuration = Math.max(position, this.header?.duration ?? 0);
   }
-  
+
   /**
    * Parse the file header
    */
@@ -584,84 +614,89 @@ export class DMXPlayer {
     if (buffer.length < HEADER_SIZE) {
       throw new Error("Invalid recording file: too small");
     }
-    
+
     let offset = 0;
-    
+
     // Magic bytes
     const magic = buffer.toString("ascii", offset, offset + 4);
     offset += 4;
-    
+
     if (magic !== DMXREC_MAGIC) {
       throw new Error(`Invalid recording file: bad magic bytes "${magic}"`);
     }
-    
+
     // Version
     const version = buffer.readUInt8(offset++);
     if (version > DMXREC_VERSION) {
       throw new Error(`Unsupported recording version: ${version}`);
     }
-    
+
     // Flags
     const flags = buffer.readUInt8(offset++);
-    
+
     // Protocol
     const protocol = buffer.readUInt8(offset++);
-    
-    // Universe
+
+    // Universe (first universe for v2, the only universe for v1)
     const universe = buffer.readUInt16LE(offset);
     offset += 2;
-    
+
     // Start timestamp
     const startTime = Number(buffer.readBigInt64LE(offset));
     offset += 8;
-    
+
     // Duration
     const duration = buffer.readUInt32LE(offset);
     offset += 4;
-    
+
     // Frame count
     const frameCount = buffer.readUInt32LE(offset);
-    
+    offset += 4;
+
+    // Universe count (v2 only; v1 reserved bytes are zero)
+    const universeCount = version >= 2 ? buffer.readUInt16LE(offset) : 1;
+
     return {
       magic,
       version,
       flags,
       protocol,
       universe,
+      universeCount,
       startTime,
       duration,
       frameCount,
     };
   }
-  
+
   /**
    * Set callback for frame updates during playback
    */
-  onFrame(callback: (channels: Uint8Array) => void): void {
+  onFrame(callback: PlayerFrameCallback): void {
     this.onFrameCallback = callback;
   }
-  
+
   /**
    * Set callback for playback finished
    */
   onFinished(callback: () => void): void {
     this.onFinishedCallback = callback;
   }
-  
+
   /**
    * Set callback for position updates
    */
   onPosition(callback: (position: number, duration: number) => void): void {
     this.onPositionCallback = callback;
   }
-  
+
   /**
    * Set callback for state changes
    */
   onStateChange(callback: (state: PlaybackState) => void): void {
     this.onStateChangeCallback = callback;
   }
-  
+
   /**
    * Set playback state and notify listeners
    */
@@ -673,7 +708,52 @@ export class DMXPlayer {
       }
     }
   }
-  
+
+  /** True if frames for this universe should be output */
+  private isUniverseEnabled(universe: number): boolean {
+    return !this.universeFilter || this.universeFilter.has(universe);
+  }
+
+  /** Apply a decoded frame to the per-universe state */
+  private applyFrame(frame: RecordingFrame): Uint8Array {
+    let ch = this.channels.get(frame.universe);
+    if (!ch) {
+      ch = new Uint8Array(TOTAL_CHANNELS);
+      this.channels.set(frame.universe, ch);
+    }
+    if (frame.isSnapshot && frame.snapshotData) {
+      ch.set(frame.snapshotData);
+    } else {
+      for (const change of frame.changes) {
+        ch[change.channel] = change.value;
+      }
+    }
+    return ch;
+  }
+
+  /** Emit the current state of every (enabled) universe */
+  private emitAllUniverses(): void {
+    if (!this.onFrameCallback) return;
+    const list = this.universes.length > 0 ? this.universes : Array.from(this.channels.keys());
+    for (const universe of list) {
+      if (!this.isUniverseEnabled(universe)) continue;
+      this.onFrameCallback(universe, this.getChannels(universe));
+    }
+  }
+
+  /** Cancel the frame timer, returning any read-but-unapplied frame to the stream */
+  private cancelPendingFrame(): void {
+    if (this.playbackTimer) {
+      clearTimeout(this.playbackTimer);
+      this.playbackTimer = null;
+    }
+    if (this.pending) {
+      this.frameOffset = this.pending.startOffset;
+      this.currentPosition -= this.pending.deltaTime;
+      this.pending = null;
+    }
+  }
+
   /**
    * Start or resume playback
    */
@@ -681,9 +761,9 @@ export class DMXPlayer {
     if (!this.frameData || !this.header) {
       throw new Error("No recording loaded");
     }
-    
+
     if (this.state === "playing") return;
-    
+
     if (this.state === "paused") {
       // Resume from paused position - adjust for speed
       this.playbackStartTime = Date.now() - (this.pausedPosition / this.speed);
@@ -693,32 +773,29 @@ export class DMXPlayer {
       this.frameOffset = 0;
       this.currentFrame = 0;
       this.currentPosition = 0;
-      this.channels.fill(0);
+      this.channels.clear();
     }
-    
+
     this.setState("playing");
     this.scheduleNextFrame();
-    
+
     logInfo("Playback started", { position: this.currentPosition, speed: this.speed });
   }
-  
+
   /**
    * Pause playback
    */
   pause(): void {
     if (this.state !== "playing") return;
-    
-    if (this.playbackTimer) {
-      clearTimeout(this.playbackTimer);
-      this.playbackTimer = null;
-    }
-    
+
+    this.cancelPendingFrame();
+
     this.pausedPosition = this.currentPosition;
     this.setState("paused");
-    
+
     logInfo("Playback paused", { position: this.currentPosition });
   }
-  
+
   /**
    * Toggle play/pause
    */
@@ -732,12 +809,12 @@ export class DMXPlayer {
         this.currentFrame = 0;
         this.currentPosition = 0;
         this.pausedPosition = 0;
-        this.channels.fill(0);
+        this.channels.clear();
       }
       this.play();
     }
   }
-  
+
   /**
    * Stop playback and reset to beginning
    */
@@ -746,33 +823,32 @@ export class DMXPlayer {
       clearTimeout(this.playbackTimer);
       this.playbackTimer = null;
     }
-    
+    this.pending = null;
+
     this.frameOffset = 0;
     this.currentFrame = 0;
     this.currentPosition = 0;
     this.pausedPosition = 0;
-    this.channels.fill(0);
+    this.channels.clear();
     this.setState("idle");
-    
+
     // Emit position update
     if (this.onPositionCallback && this.header) {
-      this.onPositionCallback(0, this.header.duration);
+      this.onPositionCallback(0, this.totalDuration);
     }
-    
-    // Emit frame with zeroed channels
-    if (this.onFrameCallback) {
-      this.onFrameCallback(this.channels);
-    }
-    
+
+    // Emit zeroed frames (blackout) for every universe in the recording
+    this.emitAllUniverses();
+
     logInfo("Playback stopped");
   }
-  
+
   /**
    * Set playback speed
    */
   setSpeed(speed: number): void {
     const clampedSpeed = Math.max(0.1, Math.min(10.0, speed));
-    
+
     if (this.state === "playing") {
       // Adjust playback start time to maintain position
       const elapsed = this.currentPosition;
@@ -781,10 +857,10 @@ export class DMXPlayer {
     } else {
       this.speed = clampedSpeed;
     }
-    
+
     logInfo("Playback speed changed", { speed: this.speed });
   }
-  
+
   /**
    * Increase speed to next preset
    */
@@ -794,7 +870,7 @@ export class DMXPlayer {
       this.setSpeed(SPEED_PRESETS[currentIndex + 1] ?? this.speed);
     }
   }
-  
+
   /**
    * Decrease speed to previous preset
    */
@@ -807,7 +883,7 @@ export class DMXPlayer {
       this.setSpeed(SPEED_PRESETS[SPEED_PRESETS.length - 1] ?? this.speed);
     }
   }
-  
+
   /**
    * Toggle loop mode
    */
@@ -815,7 +891,7 @@ export class DMXPlayer {
     this.loopEnabled = !this.loopEnabled;
     logInfo("Loop mode changed", { enabled: this.loopEnabled });
   }
-  
+
   /**
    * Set loop mode
    */
@@ -823,104 +899,64 @@ export class DMXPlayer {
     this.loopEnabled = enabled;
     logInfo("Loop mode set", { enabled: this.loopEnabled });
   }
-  
+
   /**
-   * Seek to a specific position (ms)
+   * Seek to a specific position (ms).
+   *
+   * Frames of different universes are interleaved with per-universe
+   * snapshots, so the state at any position is rebuilt by replaying the
+   * (in-memory) stream from the start without emitting anything.
    */
   seek(positionMs: number): void {
     if (!this.frameData || !this.header) return;
-    
-    // Build frame index if not already built (lazy initialization)
-    if (!this.frameIndexBuilt) {
-      this.buildFrameIndex();
-    }
-    
+
     const wasPlaying = this.state === "playing";
-    
-    // Pause if playing
+
     if (wasPlaying) {
       if (this.playbackTimer) {
         clearTimeout(this.playbackTimer);
         this.playbackTimer = null;
       }
+      this.pending = null;
     }
-    
+
     // Clamp position
-    const targetPosition = Math.max(0, Math.min(positionMs, this.header.duration));
-    
-    // Find the nearest snapshot before target position
-    let snapshotIndex = -1;
-    
-    for (let i = this.frameIndex.length - 1; i >= 0; i--) {
-      const entry = this.frameIndex[i];
-      if (entry && entry.position <= targetPosition) {
-        snapshotIndex = i;
-        break;
-      }
-    }
-    
-    // Reset channels
-    this.channels.fill(0);
-    
-    // If we found a snapshot, start from there
-    if (snapshotIndex >= 0) {
-      const entry = this.frameIndex[snapshotIndex];
-      if (entry) {
-        this.frameOffset = entry.offset;
-        this.currentPosition = entry.position;
-        this.currentFrame = snapshotIndex;
-        
-        // Read and apply the snapshot
-        const frame = this.readNextFrame();
-        if (frame?.isSnapshot && frame.snapshotData) {
-          this.channels.set(frame.snapshotData);
-        }
-      }
-    } else {
-      // No snapshot found, start from beginning
-      this.frameOffset = 0;
-      this.currentPosition = 0;
-      this.currentFrame = 0;
-    }
-    
-    // Replay frames until we reach target position
-    while (this.currentPosition < targetPosition && this.frameOffset < this.frameData.length) {
+    const targetPosition = Math.max(0, Math.min(positionMs, this.totalDuration));
+
+    this.channels.clear();
+    this.frameOffset = 0;
+    this.currentPosition = 0;
+    this.currentFrame = 0;
+
+    // Replay frames up to the target position
+    for (;;) {
+      const startOffset = this.frameOffset;
       const frame = this.readNextFrame();
       if (!frame) break;
-      
-      this.currentPosition += frame.deltaTime;
-      this.currentFrame++;
-      
-      if (this.currentPosition > targetPosition) {
+
+      if (this.currentPosition + frame.deltaTime > targetPosition) {
         // Went past target, back up
-        this.currentPosition -= frame.deltaTime;
+        this.frameOffset = startOffset;
         break;
       }
-      
-      // Apply frame
-      if (frame.isSnapshot && frame.snapshotData) {
-        this.channels.set(frame.snapshotData);
-      } else {
-        for (const change of frame.changes) {
-          this.channels[change.channel] = change.value;
-        }
-      }
+
+      this.currentPosition += frame.deltaTime;
+      this.currentFrame++;
+      this.applyFrame(frame);
     }
-    
+
     this.pausedPosition = this.currentPosition;
-    
+
     // Emit position update
     if (this.onPositionCallback) {
-      this.onPositionCallback(this.currentPosition, this.header.duration);
+      this.onPositionCallback(this.currentPosition, this.totalDuration);
     }
-    
-    // Emit frame with current channels
-    if (this.onFrameCallback) {
-      this.onFrameCallback(this.channels);
-    }
-    
+
+    // Emit the rebuilt state of every universe
+    this.emitAllUniverses();
+
     logInfo("Seeked to position", { position: this.currentPosition, target: targetPosition });
-    
+
     // Resume if was playing
     if (wasPlaying) {
       this.playbackStartTime = Date.now() - (this.currentPosition / this.speed);
@@ -928,150 +964,155 @@ export class DMXPlayer {
       this.scheduleNextFrame();
     }
   }
-  
+
   /**
    * Seek forward by specified milliseconds
    */
   seekForward(ms: number = 5000): void {
     this.seek(this.currentPosition + ms);
   }
-  
+
   /**
    * Seek backward by specified milliseconds
    */
   seekBackward(ms: number = 5000): void {
     this.seek(this.currentPosition - ms);
   }
-  
+
+  /** Restart from the beginning for looping */
+  private restartForLoop(): void {
+    logInfo("Looping playback");
+    this.frameOffset = 0;
+    this.currentFrame = 0;
+    this.currentPosition = 0;
+    this.channels.clear();
+    this.playbackStartTime = Date.now();
+    this.scheduleNextFrame();
+  }
+
   /**
    * Schedule the next frame for playback
    */
   private scheduleNextFrame(): void {
     if (this.state !== "playing" || !this.frameData || !this.header) return;
-    
-    // Check if we've reached the end
-    if (this.frameOffset >= this.frameData.length || this.currentFrame >= this.header.frameCount) {
-      if (this.loopEnabled) {
-        // Loop back to beginning
-        logInfo("Looping playback");
-        this.frameOffset = 0;
-        this.currentFrame = 0;
-        this.currentPosition = 0;
-        this.channels.fill(0);
-        this.playbackStartTime = Date.now();
-        this.scheduleNextFrame();
-        return;
-      }
-      
-      this.setState("finished");
-      if (this.onFinishedCallback) {
-        this.onFinishedCallback();
-      }
-      return;
-    }
-    
-    // Read the next frame
-    const frame = this.readNextFrame();
+
+    const startOffset = this.frameOffset;
+    const frame = this.frameOffset >= this.frameData.length ? null : this.readNextFrame();
+
+    // End of recording
     if (!frame) {
-      if (this.loopEnabled) {
-        // Loop back to beginning
-        this.frameOffset = 0;
-        this.currentFrame = 0;
-        this.currentPosition = 0;
-        this.channels.fill(0);
-        this.playbackStartTime = Date.now();
-        this.scheduleNextFrame();
+      if (this.loopEnabled && this.totalFrames > 0) {
+        this.restartForLoop();
         return;
       }
-      
+
       this.setState("finished");
       if (this.onFinishedCallback) {
         this.onFinishedCallback();
       }
       return;
     }
-    
-    // Calculate when this frame should be displayed (adjusted for speed)
+
+    // Calculate when this frame should be output (adjusted for speed)
     this.currentPosition += frame.deltaTime;
     const adjustedPosition = this.currentPosition / this.speed;
     const targetTime = this.playbackStartTime + adjustedPosition;
     const delay = Math.max(0, targetTime - Date.now());
-    
+
+    this.pending = { startOffset, deltaTime: frame.deltaTime };
     this.playbackTimer = setTimeout(() => {
-      // Apply frame to channel data
-      if (frame.isSnapshot && frame.snapshotData) {
-        this.channels.set(frame.snapshotData);
-      } else {
-        for (const change of frame.changes) {
-          this.channels[change.channel] = change.value;
-        }
-      }
-      
+      this.playbackTimer = null;
+      this.pending = null;
+
+      // Apply frame to the universe's channel data
+      const channels = this.applyFrame(frame);
       this.currentFrame++;
-      
-      // Emit frame
-      if (this.onFrameCallback) {
-        this.onFrameCallback(this.channels);
+
+      // Emit frame (only for enabled universes)
+      if (this.onFrameCallback && this.isUniverseEnabled(frame.universe)) {
+        this.onFrameCallback(frame.universe, channels);
       }
-      
-      // Emit position update (throttled - every 100ms worth of playback)
-      if (this.onPositionCallback && this.header) {
-        this.onPositionCallback(this.currentPosition, this.header.duration);
+
+      // Emit position update
+      if (this.onPositionCallback) {
+        this.onPositionCallback(this.currentPosition, this.totalDuration);
       }
-      
+
       // Schedule next frame
       this.scheduleNextFrame();
     }, delay);
   }
-  
+
   /**
-   * Read the next frame from the buffer
+   * Read the next frame from the buffer. Returns null at end of data.
+   * Throws RangeError on a truncated frame.
    */
   private readNextFrame(): RecordingFrame | null {
-    if (!this.frameData || this.frameOffset >= this.frameData.length) {
+    if (!this.frameData || !this.header || this.frameOffset >= this.frameData.length) {
       return null;
     }
-    
+
+    const isV2 = this.header.version >= 2;
+    const data = this.frameData;
+
     // Read delta time (varint)
-    const { value: deltaTime, bytesRead: deltaBytes } = decodeVarint(this.frameData, this.frameOffset);
-    this.frameOffset += deltaBytes;
-    
+    const { value: deltaTime, bytesRead: deltaBytes } = decodeVarint(data, this.frameOffset);
+    let offset = this.frameOffset + deltaBytes;
+
+    // v2: universe for this frame
+    let universe = this.header.universe;
+    if (isV2) {
+      universe = data.readUInt16LE(offset);
+      offset += 2;
+    }
+
     // Read change count
-    const changeCount = this.frameData[this.frameOffset++];
+    const changeCount = data[offset++];
     if (changeCount === undefined) return null;
-    
+
     // Check for snapshot frame
     if (changeCount === FrameType.SNAPSHOT) {
-      const snapshotData = new Uint8Array(this.frameData.subarray(this.frameOffset, this.frameOffset + TOTAL_CHANNELS));
-      this.frameOffset += TOTAL_CHANNELS;
-      
+      if (offset + TOTAL_CHANNELS > data.length) {
+        throw new RangeError("Truncated snapshot frame");
+      }
+      const snapshotData = new Uint8Array(data.subarray(offset, offset + TOTAL_CHANNELS));
+      this.frameOffset = offset + TOTAL_CHANNELS;
+
       return {
+        universe,
         deltaTime,
         changes: [],
         isSnapshot: true,
         snapshotData,
       };
     }
-    
+
     // Read change count (possibly extended)
     let actualChangeCount = changeCount;
     if (changeCount === FrameType.EXTENDED) {
-      actualChangeCount = this.frameData.readUInt16LE(this.frameOffset);
-      this.frameOffset += 2;
+      actualChangeCount = data.readUInt16LE(offset);
+      offset += 2;
     }
-    
+
+    if (offset + actualChangeCount * 3 > data.length) {
+      throw new RangeError("Truncated delta frame");
+    }
+
     // Read changes
     const changes: ChannelChange[] = [];
     for (let i = 0; i < actualChangeCount; i++) {
-      const channel = this.frameData.readUInt16LE(this.frameOffset);
-      this.frameOffset += 2;
-      const value = this.frameData[this.frameOffset++];
-      if (value !== undefined) {
+      const channel = data.readUInt16LE(offset);
+      offset += 2;
+      const value = data[offset++];
+      if (value !== undefined && channel < TOTAL_CHANNELS) {
         changes.push({ channel, value });
       }
     }
-    
+
+    this.frameOffset = offset;
+
     return {
+      universe,
       deltaTime,
       changes,
       isSnapshot: false,

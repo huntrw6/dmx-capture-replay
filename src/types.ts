@@ -27,7 +27,12 @@ export interface CLIOptions {
   protocol?: Protocol;
   interface?: string;
   address?: string;
-  universe?: number;
+  /** Universes to monitor/record (or play back, as a filter). Wire numbering. */
+  universes?: number[];
+  /** Monitor/record every universe seen (Art-Net only) */
+  allUniverses?: boolean;
+  /** Playback remap: source universe -> destination universe */
+  universeMap?: Map<number, number>;
   multicast?: boolean;
   broadcast?: boolean;
   verbose?: boolean;
@@ -53,7 +58,10 @@ export interface MonitorConfig {
   netmask?: string;
   useMulticast: boolean;
   useBroadcast: boolean;
-  selectedUniverse?: number;
+  /** Universes selected up front (wire numbering). Empty = not yet chosen. */
+  selectedUniverses: number[];
+  /** Accept every universe that appears (Art-Net only) */
+  allUniverses: boolean;
   verbose: boolean;
   logFile?: string;
 }
@@ -111,6 +119,8 @@ export const SACN_MAX_UNIVERSE = 63999;
 
 /** sACN source information for priority tracking */
 export interface SACNSourceInfo {
+  /** Universe this source is sending to */
+  universe?: number;
   /** Source name from sACN packet */
   sourceName: string;
   /** Source IP address */
@@ -130,7 +140,7 @@ export interface ProtocolEvents {
   universeDiscovered: (universe: number) => void;
   nodeDiscovered: (node: ArtNetNode) => void;
   /** Emitted when multiple sACN sources are detected on the same universe */
-  sourcesChanged: (sources: SACNSourceInfo[]) => void;
+  sourcesChanged: (universe: number, sources: SACNSourceInfo[]) => void;
   close: () => void;
 }
 
@@ -223,7 +233,7 @@ export function isValidIPv4(ip: string): boolean {
 export const DMXREC_MAGIC = "DMXR";
 
 /** Current recording file format version */
-export const DMXREC_VERSION = 1;
+export const DMXREC_VERSION = 2;
 
 /** Recording file header (32 bytes) */
 export interface RecordingHeader {
@@ -235,8 +245,10 @@ export interface RecordingHeader {
   flags: number;
   /** Protocol used (0=sACN, 1=Art-Net) */
   protocol: number;
-  /** Universe number */
+  /** First (lowest) universe in the recording. v1 files: the only universe. */
   universe: number;
+  /** Number of distinct universes recorded (v1 files: 1) */
+  universeCount: number;
   /** Start timestamp (Unix ms) */
   startTime: number;
   /** Total duration in ms */
@@ -271,6 +283,8 @@ export interface ChannelChange {
 
 /** A recorded frame with delta changes */
 export interface RecordingFrame {
+  /** Universe this frame belongs to */
+  universe: number;
   /** Time offset from previous frame in ms */
   deltaTime: number;
   /** Channel changes in this frame */
@@ -317,4 +331,55 @@ export interface PlaybackStats {
   totalFrames: number;
   /** File being played */
   filePath: string | null;
+}
+/**
+ * Parse a universe list such as "1", "1,2,5" or "1-4,7" into a sorted,
+ * de-duplicated array. Throws on malformed input.
+ * Numbers are returned exactly as typed (no 0/1-based conversion).
+ */
+export function parseUniverseList(input: string): number[] {
+  const out = new Set<number>();
+  for (const rawPart of String(input).split(",")) {
+    const part = rawPart.trim();
+    if (part === "") continue;
+    const range = /^(\d+)\s*-\s*(\d+)$/.exec(part);
+    if (range) {
+      const a = parseInt(range[1]!, 10);
+      const b = parseInt(range[2]!, 10);
+      if (b < a) throw new Error(`Invalid universe range "${part}"`);
+      if (b - a > 4096) throw new Error(`Universe range "${part}" is too large`);
+      for (let u = a; u <= b; u++) out.add(u);
+    } else if (/^\d+$/.test(part)) {
+      out.add(parseInt(part, 10));
+    } else {
+      throw new Error(`Invalid universe "${part}"`);
+    }
+  }
+  if (out.size === 0) throw new Error("No universes given");
+  return Array.from(out).sort((x, y) => x - y);
+}
+
+/**
+ * Parse a universe map such as "1=5,2=6" into Map(source -> destination).
+ */
+export function parseUniverseMap(input: string): Map<number, number> {
+  const map = new Map<number, number>();
+  for (const rawPart of String(input).split(",")) {
+    const part = rawPart.trim();
+    if (part === "") continue;
+    const m = /^(\d+)\s*=\s*(\d+)$/.exec(part);
+    if (!m) throw new Error(`Invalid universe mapping "${part}" (expected SRC=DST)`);
+    map.set(parseInt(m[1]!, 10), parseInt(m[2]!, 10));
+  }
+  if (map.size === 0) throw new Error("No universe mappings given");
+  return map;
+}
+
+/**
+ * Convert a universe number between protocols using the display convention
+ * (Art-Net wire 0 == universe 1 == sACN 1).
+ */
+export function convertUniverse(universe: number, from: Protocol, to: Protocol): number {
+  if (from === to) return universe;
+  return from === "artnet" ? universe + 1 : universe - 1;
 }

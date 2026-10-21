@@ -21,7 +21,8 @@ export interface PlaybackInfo {
   speed: number;
   loopEnabled: boolean;
   fileName: string;
-  universe: number;
+  /** Universes in the recording being played (wire numbering of `protocol`) */
+  universes: number[];
   protocol: string;
 }
 
@@ -95,7 +96,12 @@ export class DisplayManager {
   private headerBox: blessed.Widgets.BoxElement | null = null;
   private footerBox: blessed.Widgets.BoxElement | null = null;
   private readonly config: DisplayConfig;
+  /** Channel values of the universe currently shown on the grid */
   private channelData: Uint8Array;
+  /** Latest channel values of every universe seen */
+  private universeData: Map<number, Uint8Array> = new Map();
+  /** Universe currently shown on the grid (null until the first one arrives) */
+  private viewedUniverse: number | null = null;
   private stats: MonitorStats;
   private updateInterval: NodeJS.Timeout | null = null;
   private isRunning = false;
@@ -130,7 +136,7 @@ export class DisplayManager {
     speed: 1.0,
     loopEnabled: false,
     fileName: "",
-    universe: 0,
+    universes: [],
     protocol: "sacn",
   };
 
@@ -144,7 +150,7 @@ export class DisplayManager {
   private onLoopToggleCallback: (() => void) | null = null;
 
   // sACN competing sources warning
-  private competingSources: SACNSourceInfo[] = [];
+  private competingSources: Map<number, SACNSourceInfo[]> = new Map();
 
   constructor(config: DisplayConfig = {}) {
     this.config = {
@@ -546,16 +552,16 @@ export class DisplayManager {
 
     const modeText = this._displayMode === "value" ? "VALUES" : "CHANNELS";
     const recText = this._recordingState === "recording" ? "*** RECORDING ***" : "{bold}R{/bold}: Record";
+    const uniKeys = this.universeData.size > 1 ? " | {bold}[ ]{/bold}: Universe" : "";
 
     if (this.layoutMode === "hidden") {
       // Include basic stats in footer when stats panel is hidden
-      // Convert universe to user-facing display format
-      const displayUniverse = formatUniverseForDisplay(this.stats.universe, this.stats.protocol);
+      const displayUniverse = this.getViewedUniverseText(this.stats.protocol);
       const pps = this.stats.packetsPerSecond.toFixed(0);
-      return ` {bold}Q{/bold}: Quit | ${recText} | {bold}C{/bold}: Clear | {bold}V{/bold}: Toggle (${modeText}) | Pkts: ${this.stats.packetsReceived} | ${pps}/s | U:${displayUniverse} `;
+      return ` {bold}Q{/bold}: Quit | ${recText} | {bold}C{/bold}: Clear | {bold}V{/bold}: Toggle (${modeText})${uniKeys} | Pkts: ${this.stats.packetsReceived} | ${pps}/s | U:${displayUniverse} `;
     }
 
-    return ` {bold}Q{/bold}: Quit | ${recText} | {bold}C{/bold}: Clear | {bold}V{/bold}: Toggle (${modeText}) `;
+    return ` {bold}Q{/bold}: Quit | ${recText} | {bold}C{/bold}: Clear | {bold}V{/bold}: Toggle (${modeText})${uniKeys} `;
   }
 
   /**
@@ -565,7 +571,8 @@ export class DisplayManager {
     const playPauseText = this.playbackInfo.state === "playing" ? "Pause" : "Play";
     const loopText = this.playbackInfo.loopEnabled ? "{green-fg}L{/green-fg}" : "L";
 
-    return ` {bold}Space{/bold}: ${playPauseText} | {bold}S{/bold}: Stop | {bold}${loopText}{/bold}: Loop | {bold}+/-{/bold}: Speed | {bold}←/→{/bold}: Seek | {bold}Q{/bold}: Quit `;
+    const uniKeys = this.universeData.size > 1 ? " | {bold}[ ]{/bold}: Universe" : "";
+    return ` {bold}Space{/bold}: ${playPauseText} | {bold}S{/bold}: Stop | {bold}${loopText}{/bold}: Loop | {bold}+/-{/bold}: Speed | {bold}←/→{/bold}: Seek${uniKeys} | {bold}Q{/bold}: Quit `;
   }
 
   /**
@@ -758,6 +765,14 @@ export class DisplayManager {
     this.screen.key(["q", "C-c", "escape"], () => {
       this.stop();
       process.exit(0);
+    });
+
+    // Switch the universe shown on the grid
+    this.screen.key(["]", "pagedown"], () => {
+      this.nextUniverse();
+    });
+    this.screen.key(["[", "pageup"], () => {
+      this.previousUniverse();
     });
 
     if (this._uiMode === "playback") {
@@ -976,16 +991,110 @@ export class DisplayManager {
   }
 
   /**
-   * Update channel data
+   * Update channel data for one universe. The first universe to arrive is
+   * shown on the grid; use nextUniverse()/previousUniverse() to switch.
    */
-  updateChannels(channels: Uint8Array): void {
+  updateChannels(universe: number, channels: Uint8Array): void {
+    let store = this.universeData.get(universe);
+    const isNew = !store;
+    if (!store) {
+      store = new Uint8Array(TOTAL_CHANNELS);
+      this.universeData.set(universe, store);
+    }
     for (let i = 0; i < Math.min(channels.length, TOTAL_CHANNELS); i++) {
       const value = channels[i];
       if (value !== undefined) {
-        this.channelData[i] = value;
+        store[i] = value;
       }
     }
+
+    if (this.viewedUniverse === null) {
+      this.viewedUniverse = universe;
+      this.channelData.set(store);
+    } else if (this.viewedUniverse === universe) {
+      this.channelData.set(store);
+    }
+
+    if (isNew) {
+      this.refreshUniverseText();
+    }
     this.needsRender = true;
+  }
+
+  /**
+   * Pre-register universes (e.g. every universe of a recording) so they can be
+   * browsed before any data arrives.
+   */
+  setUniverses(universes: number[]): void {
+    for (const universe of universes) {
+      if (!this.universeData.has(universe)) {
+        this.universeData.set(universe, new Uint8Array(TOTAL_CHANNELS));
+      }
+    }
+    if (this.viewedUniverse === null && universes.length > 0) {
+      const first = this.getSortedUniverses()[0];
+      if (first !== undefined) {
+        this.viewedUniverse = first;
+        this.channelData.set(this.universeData.get(first) ?? new Uint8Array(TOTAL_CHANNELS));
+      }
+    }
+    this.refreshUniverseText();
+    this.needsRender = true;
+  }
+
+  private getSortedUniverses(): number[] {
+    return Array.from(this.universeData.keys()).sort((a, b) => a - b);
+  }
+
+  /** Universe currently shown on the grid */
+  getViewedUniverse(): number | null {
+    return this.viewedUniverse;
+  }
+
+  /** Switch the grid to a specific universe (no-op if unknown) */
+  viewUniverse(universe: number): void {
+    const data = this.universeData.get(universe);
+    if (!data) return;
+    this.viewedUniverse = universe;
+    this.channelData.set(data);
+    this.refreshUniverseText();
+    this.needsRender = true;
+  }
+
+  /** Show the next universe (wraps around) */
+  nextUniverse(): void {
+    this.stepUniverse(1);
+  }
+
+  /** Show the previous universe (wraps around) */
+  previousUniverse(): void {
+    this.stepUniverse(-1);
+  }
+
+  private stepUniverse(delta: number): void {
+    const list = this.getSortedUniverses();
+    if (list.length < 2) return;
+    const current = this.viewedUniverse === null ? -1 : list.indexOf(this.viewedUniverse);
+    const next = (current + delta + list.length) % list.length;
+    const target = list[next];
+    if (target !== undefined) {
+      this.viewUniverse(target);
+    }
+  }
+
+  /** Text like "3 (2/5)" for the viewed universe, or "-" before any data */
+  private getViewedUniverseText(protocol: string): string {
+    if (this.viewedUniverse === null) return "-";
+    const list = this.getSortedUniverses();
+    const label = formatUniverseForDisplay(this.viewedUniverse, protocol as Protocol);
+    return list.length > 1 ? `${label} [${list.indexOf(this.viewedUniverse) + 1}/${list.length}]` : label;
+  }
+
+  /** Re-render footer/header parts that mention the universe selection */
+  private refreshUniverseText(): void {
+    if (this.footerBox) {
+      this.footerBox.setContent(this.getFooterContent());
+    }
   }
 
   /**
@@ -1038,6 +1147,9 @@ export class DisplayManager {
    */
   clearChannels(): void {
     this.channelData.fill(0);
+    for (const data of this.universeData.values()) {
+      data.fill(0);
+    }
     this.needsRender = true;
     logInfo("Channels cleared");
   }
@@ -1045,8 +1157,12 @@ export class DisplayManager {
   /**
    * Update competing sources info (for sACN priority warning)
    */
-  updateCompetingSources(sources: SACNSourceInfo[]): void {
-    this.competingSources = sources;
+  updateCompetingSources(universe: number, sources: SACNSourceInfo[]): void {
+    if (sources.length === 0) {
+      this.competingSources.delete(universe);
+    } else {
+      this.competingSources.set(universe, sources);
+    }
     this.needsRender = true;
   }
 
@@ -1082,11 +1198,12 @@ export class DisplayManager {
 
     // Source info (sACN only)
     let sourceInfo = "";
-    if (this.stats.protocol === "sacn" && this.competingSources.length > 0) {
-      const activeSource = this.competingSources.find((s) => s.isActive);
-      const inactiveSources = this.competingSources.filter((s) => !s.isActive);
+    const viewedSources = this.viewedUniverse !== null ? (this.competingSources.get(this.viewedUniverse) ?? []) : [];
+    if (this.stats.protocol === "sacn" && viewedSources.length > 0) {
+      const activeSource = viewedSources.find((s) => s.isActive);
+      const inactiveSources = viewedSources.filter((s) => !s.isActive);
 
-      if (this.competingSources.length > 1) {
+      if (viewedSources.length > 1) {
         // Multiple sources - show warning
         sourceInfo = `\n {yellow-fg}⚠ Multi-source{/yellow-fg}`;
         if (activeSource) {
@@ -1109,14 +1226,20 @@ export class DisplayManager {
       }
     }
 
-    // Convert universe to user-facing display format
-    const displayUniverse = formatUniverseForDisplay(this.stats.universe, this.stats.protocol);
-    
+    // Viewed universe plus how many are active
+    const displayUniverse = this.getViewedUniverseText(this.stats.protocol);
+    const universeCount = this.universeData.size;
+    const otherMulti = Array.from(this.competingSources.entries()).filter(([u, list]) => u !== this.viewedUniverse && list.length > 1).length;
+    if (otherMulti > 0) {
+      sourceInfo += `\n {yellow-fg}⚠ ${otherMulti} other universe(s) multi-source{/yellow-fg}`;
+    }
+
     this.statsBox.setContent(
       [
         "",
         ` Protocol: ${this.stats.protocol.toUpperCase()}`,
         ` Universe: ${displayUniverse}`,
+        ` Universes: ${universeCount}`,
         "",
         ` Interface:`,
         `  ${this.stats.interfaceName ?? "All"}`,
@@ -1188,8 +1311,7 @@ export class DisplayManager {
     const loopText = info.loopEnabled ? "{green-fg}ON{/green-fg}" : "OFF";
     const speedText = info.speed === 1.0 ? "1.0x" : `${info.speed.toFixed(2)}x`;
 
-    // Convert universe to user-facing display format
-    const displayUniverse = formatUniverseForDisplay(info.universe, info.protocol as Protocol);
+    const displayUniverse = this.getViewedUniverseText(info.protocol);
     
     this.statsBox.setContent(
       [
@@ -1203,6 +1325,7 @@ export class DisplayManager {
         "",
         ` Protocol: ${info.protocol.toUpperCase()}`,
         ` Universe: ${displayUniverse}`,
+        ` Universes: ${info.universes.length}`,
         "",
         ` Speed: ${speedText}`,
         ` Loop: ${loopText}`,
@@ -1227,24 +1350,12 @@ export class DisplayManager {
           let stateIcon = "⏹";
           if (info.state === "playing") stateIcon = "▶";
           else if (info.state === "paused") stateIcon = "⏸";
-          // Convert universe to user-facing display format
-          const displayUniverse = formatUniverseForDisplay(info.universe, info.protocol as Protocol);
-          if (info.protocol === "artnet") {
-            // Avoid `... (Art-Net 0) (ARTNET)` duplication for Art-Net
-            this.headerBox.setContent(` ${this.config.title} - PLAYBACK ${stateIcon} - Universe ${displayUniverse} `);
-          } else {
-            this.headerBox.setContent(` ${this.config.title} - PLAYBACK ${stateIcon} - Universe ${displayUniverse} (${info.protocol.toUpperCase()}) `);
-          }
+          const displayUniverse = this.getViewedUniverseText(info.protocol);
+          this.headerBox.setContent(` ${this.config.title} - PLAYBACK ${stateIcon} - Universe ${displayUniverse} (${info.protocol.toUpperCase()}) `);
         } else {
           const recIndicator = this._recordingState === "recording" ? " {red-fg}● REC{/red-fg}" : "";
-          // Convert universe to user-facing display format
-          const displayUniverse = formatUniverseForDisplay(this.stats.universe, this.stats.protocol);
-          if (this.stats.protocol === "artnet") {
-            // Avoid `... (Art-Net 0) (ARTNET)` duplication for Art-Net
-            this.headerBox.setContent(` ${this.config.title} - Universe ${displayUniverse}${recIndicator} `);
-          } else {
-            this.headerBox.setContent(` ${this.config.title} - Universe ${displayUniverse} (${this.stats.protocol.toUpperCase()})${recIndicator} `);
-          }
+          const displayUniverse = this.getViewedUniverseText(this.stats.protocol);
+          this.headerBox.setContent(` ${this.config.title} - Universe ${displayUniverse} (${this.stats.protocol.toUpperCase()})${recIndicator} `);
         }
       }
 

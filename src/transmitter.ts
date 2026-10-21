@@ -20,8 +20,10 @@ export interface DMXTransmitter {
   start(): Promise<void>;
   /** Stop the transmitter */
   stop(): Promise<void>;
-  /** Send DMX channel data */
-  send(channels: Uint8Array): void;
+  /** Send DMX channel data for one universe (wire numbering of this protocol) */
+  send(universe: number, channels: Uint8Array): void;
+  /** Universes this transmitter has been configured for */
+  getUniverses(): number[];
   /** Get the protocol type */
   getProtocol(): Protocol;
 }
@@ -30,16 +32,16 @@ export interface DMXTransmitter {
 export interface ArtNetTransmitterConfig {
   /** Target IP address (unicast) or broadcast address */
   targetAddress?: string;
-  /** Universe number (0-32767) */
-  universe: number;
+  /** Universes that will be sent (0-32767), used for logging */
+  universes: number[];
   /** Bind address for the socket */
   bindAddress?: string;
 }
 
 /** sACN transmitter configuration */
 export interface SACNTransmitterConfig {
-  /** Universe number (1-63999) */
-  universe: number;
+  /** Universes to transmit on (1-63999). One sACN sender is created per universe. */
+  universes: number[];
   /** Source name to identify this sender */
   sourceName?: string;
   /** Priority (0-200, default 100) */
@@ -56,19 +58,24 @@ export interface SACNTransmitterConfig {
 export class ArtNetTransmitter implements DMXTransmitter {
   private socket: dgram.Socket | null = null;
   private readonly config: ArtNetTransmitterConfig;
-  private sequence = 0;
+  /** Art-Net sequence counters, one per universe */
+  private readonly sequences: Map<number, number> = new Map();
   private isRunning = false;
 
   constructor(config: ArtNetTransmitterConfig) {
     this.config = {
       targetAddress: config.targetAddress ?? ARTNET_BROADCAST,
-      universe: config.universe,
+      universes: config.universes,
       bindAddress: config.bindAddress ?? "0.0.0.0",
     };
   }
 
   getProtocol(): Protocol {
     return "artnet";
+  }
+
+  getUniverses(): number[] {
+    return this.config.universes.slice();
   }
 
   async start(): Promise<void> {
@@ -78,7 +85,7 @@ export class ArtNetTransmitter implements DMXTransmitter {
 
     logInfo("Starting Art-Net transmitter", {
       targetAddress: this.config.targetAddress,
-      universe: this.config.universe,
+      universes: this.config.universes,
     });
 
     return new Promise((resolve, reject) => {
@@ -110,7 +117,7 @@ export class ArtNetTransmitter implements DMXTransmitter {
           logInfo("Art-Net transmitter started", {
             localPort: address.port,
             targetAddress: this.config.targetAddress,
-            universe: this.config.universe,
+            universes: this.config.universes,
           });
           resolve();
         });
@@ -158,7 +165,7 @@ export class ArtNetTransmitter implements DMXTransmitter {
    * 16     | 2    | Length (big-endian)
    * 18     | n    | DMX data
    */
-  send(channels: Uint8Array): void {
+  send(universe: number, channels: Uint8Array): void {
     if (!this.socket || !this.isRunning) {
       return;
     }
@@ -176,14 +183,15 @@ export class ArtNetTransmitter implements DMXTransmitter {
     packet.writeUInt16BE(14, 10);
 
     // Sequence (0-255, wraps around)
-    packet.writeUInt8(this.sequence, 12);
-    this.sequence = (this.sequence + 1) & 0xff;
+    const sequence = this.sequences.get(universe) ?? 0;
+    packet.writeUInt8(sequence, 12);
+    this.sequences.set(universe, (sequence + 1) & 0xff);
 
     // Physical port (0)
     packet.writeUInt8(0, 13);
 
     // Universe (little-endian)
-    packet.writeUInt16LE(this.config.universe, 14);
+    packet.writeUInt16LE(universe, 14);
 
     // Data length (big-endian)
     packet.writeUInt16BE(dataLength, 16);
@@ -205,10 +213,12 @@ export class ArtNetTransmitter implements DMXTransmitter {
 /**
  * sACN (E1.31) DMX Transmitter
  *
- * Sends sACN packets to multicast address for the universe.
+ * Sends sACN packets to the multicast group of each universe. The sacn
+ * library binds one sender per universe, so this keeps a sender per universe
+ * (all sharing a single CID so receivers see one source with many universes).
  */
 export class SACNTransmitter implements DMXTransmitter {
-  private sender: Sender | null = null;
+  private readonly senders: Map<number, Sender> = new Map();
   private readonly config: SACNTransmitterConfig;
   private isRunning = false;
   /** Unique CID (Component Identifier) for this transmitter instance */
@@ -216,18 +226,21 @@ export class SACNTransmitter implements DMXTransmitter {
 
   constructor(config: SACNTransmitterConfig) {
     this.config = {
-      universe: config.universe,
+      universes: Array.from(new Set(config.universes)).sort((a, b) => a - b),
       sourceName: config.sourceName ?? "DMX Monitor Playback",
       priority: config.priority ?? 100,
       interfaceAddress: config.interfaceAddress,
     };
     // Generate a unique CID (UUID) for this transmitter instance
-    // This ensures multiple playback instances are identified as separate sources
     this.cid = crypto.randomBytes(16);
   }
 
   getProtocol(): Protocol {
     return "sacn";
+  }
+
+  getUniverses(): number[] {
+    return this.config.universes.slice();
   }
 
   async start(): Promise<void> {
@@ -236,7 +249,7 @@ export class SACNTransmitter implements DMXTransmitter {
     }
 
     logInfo("Starting sACN transmitter", {
-      universe: this.config.universe,
+      universes: this.config.universes,
       sourceName: this.config.sourceName,
       priority: this.config.priority,
       cid: this.cid.toString("hex").substring(0, 8) + "...",
@@ -260,73 +273,88 @@ export class SACNTransmitter implements DMXTransmitter {
         }
       }
 
-      this.sender = new Sender({
-        universe: this.config.universe,
-        iface: ifaceAddress,
-        reuseAddr: true,
-        defaultPacketOptions: {
-          cid: this.cid,
-          sourceName: this.config.sourceName,
-          priority: this.config.priority,
-        },
-      });
+      for (const universe of this.config.universes) {
+        this.senders.set(universe, this.createSender(universe, ifaceAddress));
+      }
 
       this.isRunning = true;
       logInfo("sACN transmitter started", {
-        universe: this.config.universe,
+        universes: this.config.universes,
         interface: ifaceAddress,
       });
     } catch (error) {
+      this.closeSenders();
       logError(error, "Failed to start sACN transmitter");
       throw error;
     }
   }
 
+  private createSender(universe: number, iface: string | undefined): Sender {
+    return new Sender({
+      universe,
+      iface,
+      reuseAddr: true,
+      defaultPacketOptions: {
+        cid: this.cid,
+        sourceName: this.config.sourceName,
+        priority: this.config.priority,
+        // Send exact 0-255 values (default is 0-100 percent, which rounds)
+        useRawDmxValues: true,
+      },
+    });
+  }
+
+  private closeSenders(): void {
+    for (const sender of this.senders.values()) {
+      try {
+        sender.close();
+      } catch (error) {
+        logError(error, "Error closing sACN sender");
+      }
+    }
+    this.senders.clear();
+  }
+
   async stop(): Promise<void> {
-    if (!this.isRunning || !this.sender) {
+    if (!this.isRunning) {
       return;
     }
 
     logInfo("Stopping sACN transmitter");
-
-    try {
-      this.sender.close();
-      this.sender = null;
-      this.isRunning = false;
-      logInfo("sACN transmitter stopped");
-    } catch (error) {
-      logError(error, "Error stopping sACN transmitter");
-    }
+    this.closeSenders();
+    this.isRunning = false;
+    logInfo("sACN transmitter stopped");
   }
 
   /**
-   * Send DMX data via sACN
-   *
-   * The sacn library expects channel values as percentages (0-100),
-   * so we need to convert from DMX values (0-255).
+   * Send DMX data for one universe via sACN (values are raw 0-255).
    */
-  send(channels: Uint8Array): void {
-    if (!this.sender || !this.isRunning) {
+  send(universe: number, channels: Uint8Array): void {
+    if (!this.isRunning) {
       return;
     }
 
-    // Convert to sACN payload format (object with 1-based channel keys, percentage values)
-    const payload: { [channel: number]: number } = {};
-    for (let i = 0; i < Math.min(channels.length, TOTAL_CHANNELS); i++) {
-      const value = channels[i] ?? 0;
-      // Convert DMX (0-255) to percentage (0-100)
-      payload[i + 1] = Math.round((value / 255) * 100);
+    const sender = this.senders.get(universe);
+    if (!sender) {
+      logDebug("sACN send for unconfigured universe ignored", { universe });
+      return;
     }
 
-    try {
-      this.sender.send({
+    // Channel numbers are 1-based in the sacn library
+    const payload: { [channel: number]: number } = {};
+    for (let i = 0; i < Math.min(channels.length, TOTAL_CHANNELS); i++) {
+      payload[i + 1] = channels[i] ?? 0;
+    }
+
+    sender
+      .send({
         payload,
         sourceName: this.config.sourceName,
         priority: this.config.priority,
+      })
+      .catch((error: unknown) => {
+        logError(error, "Failed to send sACN packet");
       });
-    } catch (error) {
-      logError(error, "Failed to send sACN packet");
-    }
   }
 }
 
@@ -335,7 +363,7 @@ export class SACNTransmitter implements DMXTransmitter {
  */
 export function createTransmitter(
   protocol: Protocol,
-  universe: number,
+  universes: number[],
   options?: {
     targetAddress?: string;
     sourceName?: string;
@@ -345,12 +373,12 @@ export function createTransmitter(
 ): DMXTransmitter {
   if (protocol === "artnet") {
     return new ArtNetTransmitter({
-      universe,
+      universes,
       targetAddress: options?.targetAddress,
     });
   } else {
     return new SACNTransmitter({
-      universe,
+      universes,
       sourceName: options?.sourceName,
       priority: options?.priority,
       interfaceAddress: options?.interfaceAddress,

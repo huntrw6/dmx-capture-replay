@@ -37,10 +37,10 @@ export class SACNHandler extends EventEmitter implements ProtocolHandler {
   private receiver: Receiver | null = null;
   private readonly config: SACNConfig;
   private readonly discoveredUniverses: Map<number, UniverseInfo> = new Map();
-  /** Track sources by sourceName for priority arbitration */
+  /** Track sources (keyed by universe + sender) for priority arbitration */
   private readonly sources: Map<string, SACNSourceInfo> = new Map();
-  /** Currently active source (highest priority) */
-  private activeSource: string | null = null;
+  /** Currently active (highest priority) source key, per universe */
+  private readonly activeSources: Map<number, string> = new Map();
   private isRunning = false;
   /** Timer for cleaning up stale sources */
   private sourceCleanupTimer: NodeJS.Timeout | null = null;
@@ -156,7 +156,7 @@ export class SACNHandler extends EventEmitter implements ProtocolHandler {
       this.receiver = null;
       this.isRunning = false;
       this.sources.clear();
-      this.activeSource = null;
+      this.activeSources.clear();
       this.emit("close");
       logInfo("sACN receiver stopped");
     } catch (error) {
@@ -231,7 +231,7 @@ export class SACNHandler extends EventEmitter implements ProtocolHandler {
     // Use CID (if available) or sourceAddress to create unique source key
     // This handles multiple senders with the same sourceName
     const sourceName = packet.sourceName ?? "Unknown";
-    const sourceKey = this.getSourceKey(packet);
+    const sourceKey = `${universe}:${this.getSourceKey(packet)}`;
     const priority = packet.priority ?? 100;
 
     // Debug: log source identification info (log every 100th packet to reduce spam)
@@ -239,13 +239,13 @@ export class SACNHandler extends EventEmitter implements ProtocolHandler {
       logInfo(`sACN source info - name: "${sourceName}", key: ${sourceKey.substring(0, 16)}..., pri: ${priority}, cid: ${packet.cid?.toString("hex")?.substring(0, 8) ?? "none"}, addr: ${packet.sourceAddress ?? "none"}, sources tracked: ${this.sources.size}`);
     }
 
-    const shouldEmit = this.updateSourceTracking(sourceKey, sourceName, packet.sourceAddress, priority, now);
+    const shouldEmit = this.updateSourceTracking(universe, sourceKey, sourceName, packet.sourceAddress, priority, now);
 
     // Only emit packet if this is from the highest priority source
     if (!shouldEmit) {
       // Log ignored packets periodically
       if (existingInfo && existingInfo.packetCount % 100 === 1) {
-        logInfo(`IGNORING packet from lower priority source: ${sourceName} (pri:${priority}), active source: ${this.activeSource?.substring(0, 16)}...`);
+        logInfo(`IGNORING packet from lower priority source: ${sourceName} (pri:${priority}), active source: ${this.activeSources.get(universe)?.substring(0, 16)}...`);
       }
       return;
     }
@@ -295,15 +295,34 @@ export class SACNHandler extends EventEmitter implements ProtocolHandler {
   }
 
   /**
-   * Update source tracking and determine if packet should be emitted
-   * @returns true if this packet is from the active (highest priority) source
+   * Find the highest priority source key for one universe
    */
-  private updateSourceTracking(sourceKey: string, sourceName: string, sourceAddress: string | undefined, priority: number, now: Date): boolean {
+  private findHighestPrioritySource(universe: number): { key: string | null; priority: number } {
+    let highestPriority = -1;
+    let highestKey: string | null = null;
+    for (const [key, info] of this.sources) {
+      if (info.universe !== universe) continue;
+      if (info.priority > highestPriority) {
+        highestPriority = info.priority;
+        highestKey = key;
+      }
+    }
+    return { key: highestKey, priority: highestPriority };
+  }
+
+  /**
+   * Update source tracking and determine if packet should be emitted.
+   * Arbitration is done per universe: a high priority source on one universe
+   * must not suppress an unrelated source on another.
+   * @returns true if this packet is from the active (highest priority) source of its universe
+   */
+  private updateSourceTracking(universe: number, sourceKey: string, sourceName: string, sourceAddress: string | undefined, priority: number, now: Date): boolean {
     const existingSource = this.sources.get(sourceKey);
     const wasNewSource = !existingSource;
 
     // Update or create source info
     const sourceInfo: SACNSourceInfo = {
+      universe,
       sourceName,
       sourceAddress,
       priority,
@@ -312,36 +331,34 @@ export class SACNHandler extends EventEmitter implements ProtocolHandler {
     };
     this.sources.set(sourceKey, sourceInfo);
 
-    // Find the highest priority source
-    let highestPriority = -1;
-    let highestPrioritySource: string | null = null;
+    const { key: highestKey, priority: highestPriority } = this.findHighestPrioritySource(universe);
 
-    for (const [name, info] of this.sources) {
-      if (info.priority > highestPriority) {
-        highestPriority = info.priority;
-        highestPrioritySource = name;
+    // Update active status for all sources on this universe
+    for (const [key, info] of this.sources) {
+      if (info.universe === universe) {
+        info.isActive = key === highestKey;
       }
-    }
-
-    // Update active status for all sources
-    for (const [name, info] of this.sources) {
-      info.isActive = name === highestPrioritySource;
     }
 
     // Check if active source changed
-    const activeChanged = this.activeSource !== highestPrioritySource;
-    this.activeSource = highestPrioritySource;
+    const activeChanged = this.activeSources.get(universe) !== highestKey;
+    if (highestKey) {
+      this.activeSources.set(universe, highestKey);
+    } else {
+      this.activeSources.delete(universe);
+    }
 
-    // Emit sourcesChanged event if we have multiple sources or source list changed
+    // Emit sourcesChanged when a source appears or the active one changes
     if (wasNewSource || activeChanged) {
-      if (this.sources.size > 1) {
-        logWarn(`Multiple sACN sources detected. Active: ${highestPrioritySource} (pri:${highestPriority})`);
+      const universeSources = this.getSources(universe);
+      if (universeSources.length > 1) {
+        logWarn(`Multiple sACN sources detected on universe ${universe}. Active: ${highestKey} (pri:${highestPriority})`);
       }
-      this.emitSourcesChanged();
+      this.emitSourcesChanged(universe);
     }
 
     // Return true if this packet is from the active (highest priority) source
-    return sourceKey === highestPrioritySource;
+    return sourceKey === highestKey;
   }
 
   /**
@@ -349,71 +366,63 @@ export class SACNHandler extends EventEmitter implements ProtocolHandler {
    */
   private cleanupStaleSources(): void {
     const now = Date.now();
-    let removed = false;
+    const touchedUniverses = new Set<number>();
 
-    for (const [name, info] of this.sources) {
+    for (const [key, info] of this.sources) {
       if (now - info.lastSeen.getTime() > SOURCE_TIMEOUT_MS) {
-        this.sources.delete(name);
-        removed = true;
-        logInfo(`sACN source timed out: ${name}`);
+        this.sources.delete(key);
+        if (info.universe !== undefined) touchedUniverses.add(info.universe);
+        logInfo(`sACN source timed out: ${key}`);
       }
     }
 
-    if (removed) {
-      // Recalculate active source
-      if (this.sources.size > 0) {
-        let highestPriority = -1;
-        let highestPrioritySource: string | null = null;
-
-        for (const [name, info] of this.sources) {
-          if (info.priority > highestPriority) {
-            highestPriority = info.priority;
-            highestPrioritySource = name;
-          }
+    for (const universe of touchedUniverses) {
+      // Recalculate active source for this universe
+      const { key: highestKey } = this.findHighestPrioritySource(universe);
+      for (const [key, info] of this.sources) {
+        if (info.universe === universe) {
+          info.isActive = key === highestKey;
         }
-
-        // Update active status
-        for (const [name, info] of this.sources) {
-          info.isActive = name === highestPrioritySource;
-        }
-
-        this.activeSource = highestPrioritySource;
+      }
+      if (highestKey) {
+        this.activeSources.set(universe, highestKey);
       } else {
-        this.activeSource = null;
+        this.activeSources.delete(universe);
       }
-
-      this.emitSourcesChanged();
+      this.emitSourcesChanged(universe);
     }
   }
 
   /**
-   * Emit the sourcesChanged event with current source list
+   * Emit the sourcesChanged event with the current source list of a universe
    */
-  private emitSourcesChanged(): void {
-    const sources = this.getSources();
-    this.emit("sourcesChanged", sources);
+  private emitSourcesChanged(universe: number): void {
+    this.emit("sourcesChanged", universe, this.getSources(universe));
   }
 
   /**
-   * Get list of all tracked sources
+   * Get list of tracked sources (optionally for a single universe)
    */
-  getSources(): SACNSourceInfo[] {
-    return Array.from(this.sources.values()).sort((a, b) => b.priority - a.priority);
+  getSources(universe?: number): SACNSourceInfo[] {
+    return Array.from(this.sources.values())
+      .filter((s) => universe === undefined || s.universe === universe)
+      .sort((a, b) => b.priority - a.priority);
   }
 
   /**
-   * Get the currently active source (highest priority)
+   * Get the currently active source (highest priority) of a universe
    */
-  getActiveSource(): SACNSourceInfo | null {
-    if (!this.activeSource) return null;
-    return this.sources.get(this.activeSource) ?? null;
+  getActiveSource(universe: number): SACNSourceInfo | null {
+    const key = this.activeSources.get(universe);
+    if (!key) return null;
+    return this.sources.get(key) ?? null;
   }
 
   /**
-   * Check if there are competing sources (multiple sources with different priorities)
+   * Check if there are competing sources on a universe
    */
-  hasCompetingSources(): boolean {
-    return this.sources.size > 1;
+  hasCompetingSources(universe: number): boolean {
+    return this.getSources(universe).length > 1;
   }
 
   /**

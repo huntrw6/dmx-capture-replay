@@ -72,7 +72,10 @@ Options:
   -p, --protocol <protocol>  Protocol to use (sacn or artnet)
   -i, --interface <name>     Network interface name to bind to
   -a, --address <ip>         IP address to bind to
-  -u, --universe <number>    Universe number to monitor/playback
+  -u, --universe <list>      Universe(s) to monitor/record: 1, 1,2,5 or 1-4
+                             (playback: only play these recorded universes)
+      --all-universes        Monitor/record every universe that appears (Art-Net only)
+      --map <list>           Playback remap SRC=DST[,SRC=DST...] (recorded -> output universe)
   -m, --multicast            Enable multicast (sACN)
   -b, --broadcast            Enable broadcast (Art-Net)
   -v, --verbose              Enable verbose logging
@@ -94,6 +97,12 @@ dmx-monitor -p sacn -m
 # Monitor Art-Net on a specific interface
 dmx-monitor -p artnet -i "Ethernet" -b
 
+# Monitor and record several universes at once (sACN)
+dmx-monitor -p sacn -u 1-4 -m -o ./recordings
+
+# Record every Art-Net universe on the network
+dmx-monitor -p artnet -b --all-universes
+
 # Monitor a specific universe with verbose logging
 dmx-monitor -p sacn -u 1 -m -v
 
@@ -109,7 +118,13 @@ dmx-monitor --playback recording.dmxrec
 # Play back with loop and 2x speed
 dmx-monitor --playback recording.dmxrec --loop --speed 2.0
 
-# Play back to a specific universe with custom sACN priority
+# Play back only some of the recorded universes
+dmx-monitor --playback recording.dmxrec -u 1,3
+
+# Play a multi-universe recording shifted to other universes (1->11, 2->12)
+dmx-monitor --playback recording.dmxrec --map 1=11,2=12
+
+# Play a single-universe recording to universe 5 with custom sACN priority
 dmx-monitor --playback recording.dmxrec -u 5 --priority 150
 ```
 
@@ -120,8 +135,27 @@ dmx-monitor --playback recording.dmxrec -u 5 --priority 150
 While monitoring, press `R` to start/stop recording. Recordings are saved as `.dmxrec` files containing:
 
 - Protocol and universe information
-- Timestamped DMX frames
-- Compressed binary format for efficient storage
+- Timestamped DMX frames for every selected universe, in one file
+- Compressed binary format for efficient storage (delta frames plus periodic per-universe snapshots)
+
+Relative timing between universes is preserved: the file is a single timeline, so
+universes stay in sync on playback, seek, pause and loop.
+
+#### Multiple universes
+
+- Pick universes with `-u 1,2,5` / `-u 1-4`, or interactively. sACN joins the multicast group of each one.
+- `--all-universes` records whatever Art-Net universes appear (not available for sACN, which needs the list to join multicast groups).
+- In the monitor and playback views, **`[` / `]`** (or PageUp/PageDown) switch which universe is shown on the grid.
+  Recording and playback always cover all selected universes, whichever one you are viewing.
+- sACN priority arbitration is per universe, so a high-priority source on one universe never silences another.
+- Files from v1.0.x (single universe) still play back. New files use format version 2 and are **not** readable by v1.0.x.
+
+#### Playback universe mapping
+
+- Default: each recorded universe is sent to the same universe number.
+- Changing protocol with `-p` converts numbering so universe 1 stays universe 1 (sACN 1 = Art-Net wire 0).
+- `--map SRC=DST` sends recorded universe SRC to DST (DST uses the output protocol's wire numbering, like `-u`).
+- `-u LIST` on playback plays only those recorded universes. For a single-universe recording, a single `-u N` plays it to universe N (as in v1.0.x).
 
 Recording files are saved to the current directory by default, or to the directory specified with `-o`.
 
@@ -192,6 +226,7 @@ The monitor displays a 32x16 grid representing DMX channels 1-512:
 - Default port: 5568
 - Supports multicast addressing (239.255.x.y)
 - Universe range: 1-63999
+- Playback sends exact 0-255 values (no percent rounding); one sender per universe, sharing one source ID
 
 ### Art-Net
 

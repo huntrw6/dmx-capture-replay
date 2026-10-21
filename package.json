@@ -1,6 +1,6 @@
 {
   "name": "dmx-monitor",
-  "version": "1.0.4",
+  "version": "1.1.0",
   "description": "A Node.js console application for monitoring, recording, and playing back sACN (E1.31) and Art-Net DMX traffic in real-time.",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -18,7 +18,8 @@
     "pkg:win": "node build.js --target=win",
     "pkg:mac": "node build.js --target=mac",
     "pkg:linux": "node build.js --target=linux",
-    "pkg:all": "node build.js --target=all"
+    "pkg:all": "node build.js --target=all",
+    "test": "npm run build && node --test test/*.test.js"
   },
   "files": [
     "dist/**/*.js",
