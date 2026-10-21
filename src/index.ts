@@ -5,9 +5,9 @@
  * Main entry point with CLI argument parsing
  */
 
-import { Command } from "commander";
+import { Command, InvalidArgumentError } from "commander";
 import * as path from "path";
-import { CLIOptions, Protocol, DMXPacket, ProtocolHandler, SACNSourceInfo, isValidIPv4, formatUniverseForDisplay } from "./types";
+import { CLIOptions, Protocol, DMXPacket, ProtocolHandler, SACNSourceInfo, isValidIPv4, formatUniverseForDisplay, parseUniverseList, parseUniverseMap, convertUniverse, isValidArtNetUniverse, isValidSACNUniverse } from "./types";
 import { runSetup, confirmStart, displayDiscoveredNodes, promptNodeSelection, promptUniverseFromNode, promptManualUniverse, promptSACNUniverse, hasAllRequiredOptions, REFRESH_NODE_LIST } from "./setup";
 import { createSACNHandler, SACNHandler } from "./protocols/sacn";
 import { createArtNetHandler, ArtNetHandler } from "./protocols/artnet";
@@ -19,13 +19,31 @@ import { initLogger, logInfo, logError, logDebug, logWarn, closeLogger, formatEr
 import { isDMXMonitorError, wrapError } from "./errors";
 
 /** Application version */
-const VERSION = "1.0.0";
+const VERSION = "1.1.0";
 
 /** Packet rate calculation interval (ms) */
 const PACKET_RATE_INTERVAL = 1000;
 
 /** Art-Net discovery timeout (ms) */
 const ARTNET_DISCOVERY_TIMEOUT = 3000;
+
+/** Commander parser for -u/--universe */
+function parseUniverseOption(value: string): number[] {
+  try {
+    return parseUniverseList(value);
+  } catch (error) {
+    throw new InvalidArgumentError(error instanceof Error ? error.message : String(error));
+  }
+}
+
+/** Commander parser for --map */
+function parseMapOption(value: string): Map<number, number> {
+  try {
+    return parseUniverseMap(value);
+  } catch (error) {
+    throw new InvalidArgumentError(error instanceof Error ? error.message : String(error));
+  }
+}
 
 /**
  * Parse command line arguments
@@ -54,7 +72,9 @@ function parseArgs(): CLIOptions {
     .option("-p, --protocol <protocol>", "Protocol to use (sacn or artnet)")
     .option("-i, --interface <name>", "Network interface name to bind to")
     .option("-a, --address <ip>", "IP address to bind to")
-    .option("-u, --universe <number>", "Universe number to monitor/playback", parseInt)
+    .option("-u, --universe <list>", "Universe(s) to monitor/record, e.g. 1 or 1,2,5 or 1-4 (playback: only play these recorded universes; with a single-universe recording and a single value, plays to that universe)", parseUniverseOption)
+    .option("--all-universes", "Monitor/record every universe that appears (Art-Net only)")
+    .option("--map <list>", "Playback universe remap SRC=DST[,SRC=DST...] (recorded universe -> output universe)", parseMapOption)
     .option("-m, --multicast", "Enable multicast (sACN)")
     .option("-b, --broadcast", "Enable broadcast (Art-Net)")
     .option("-v, --verbose", "Enable verbose logging")
@@ -72,7 +92,9 @@ function parseArgs(): CLIOptions {
     protocol: opts["protocol"] as Protocol | undefined,
     interface: opts["interface"] as string | undefined,
     address: opts["address"] as string | undefined,
-    universe: opts["universe"] as number | undefined,
+    universes: opts["universe"] as number[] | undefined,
+    allUniverses: opts["allUniverses"] as boolean | undefined,
+    universeMap: opts["map"] as Map<number, number> | undefined,
     multicast: opts["multicast"] as boolean | undefined,
     broadcast: opts["broadcast"] as boolean | undefined,
     verbose: opts["verbose"] as boolean | undefined,
@@ -88,13 +110,13 @@ function parseArgs(): CLIOptions {
 /**
  * Create protocol handler based on configuration
  */
-function createProtocolHandler(protocol: Protocol, bindAddress: string, useMulticast: boolean, useBroadcast: boolean, interfaceName?: string, selectedUniverse?: number, netmask?: string): ProtocolHandler {
+function createProtocolHandler(protocol: Protocol, bindAddress: string, useMulticast: boolean, useBroadcast: boolean, interfaceName?: string, selectedUniverses?: number[], netmask?: string): ProtocolHandler {
   if (protocol === "sacn") {
     return createSACNHandler({
       bindAddress,
       useMulticast,
       interfaceName,
-      universes: selectedUniverse ? [selectedUniverse] : undefined,
+      universes: selectedUniverses && selectedUniverses.length > 0 ? selectedUniverses.slice() : undefined,
     });
   } else {
     return createArtNetHandler({
@@ -104,6 +126,65 @@ function createProtocolHandler(protocol: Protocol, bindAddress: string, useMulti
       netmask,
     });
   }
+}
+
+/**
+ * Work out which recorded universes to play and where each one is sent.
+ *
+ * - `--map SRC=DST` remaps explicitly (DST is in the output protocol's wire numbering).
+ * - A single `-u N` with a single-universe recording keeps the old meaning: play that universe to N.
+ * - Otherwise `-u` is a filter on the recorded universes.
+ * - Without a map, changing protocol converts numbering (Art-Net wire 0 == sACN 1).
+ */
+function resolvePlaybackUniverses(
+  cliOptions: CLIOptions,
+  recorded: number[],
+  recordedProtocol: Protocol,
+  outputProtocol: Protocol
+): { playUniverses: number[]; destinationOf: (recordedUniverse: number) => number } {
+  const explicitMap = new Map<number, number>(cliOptions.universeMap ?? []);
+  let playUniverses = recorded.slice();
+
+  const requested = cliOptions.universes;
+  if (requested && requested.length > 0) {
+    if (recorded.length === 1 && requested.length === 1 && !explicitMap.has(recorded[0]!)) {
+      // Legacy behaviour: -u N sends the (only) recorded universe to N
+      explicitMap.set(recorded[0]!, requested[0]!);
+    } else {
+      const missing = requested.filter((u) => !recorded.includes(u));
+      if (missing.length > 0) {
+        throw new Error(
+          `Universe(s) ${missing.join(", ")} not in recording (recording has: ${recorded.join(", ")}). ` +
+            `Use --map SRC=DST to send a recorded universe somewhere else.`
+        );
+      }
+      playUniverses = requested.slice();
+    }
+  }
+
+  for (const src of explicitMap.keys()) {
+    if (!recorded.includes(src)) {
+      throw new Error(`--map source universe ${src} is not in the recording (has: ${recorded.join(", ")})`);
+    }
+  }
+
+  const destinationOf = (u: number): number => explicitMap.get(u) ?? convertUniverse(u, recordedProtocol, outputProtocol);
+
+  const valid = outputProtocol === "artnet" ? isValidArtNetUniverse : isValidSACNUniverse;
+  const seen = new Map<number, number>();
+  for (const u of playUniverses) {
+    const dst = destinationOf(u);
+    if (!valid(dst)) {
+      throw new Error(`Recorded universe ${u} maps to ${dst}, which is not valid for ${outputProtocol} (use --map to choose a destination)`);
+    }
+    const clash = seen.get(dst);
+    if (clash !== undefined) {
+      throw new Error(`Recorded universes ${clash} and ${u} would both be sent to universe ${dst}`);
+    }
+    seen.set(dst, u);
+  }
+
+  return { playUniverses, destinationOf };
 }
 
 /**
@@ -119,7 +200,7 @@ class DMXMonitorApp {
   private packetRateInterval: NodeJS.Timeout | null = null;
   private isShuttingDown = false;
   private currentProtocol: Protocol = "sacn";
-  private currentUniverse: number = 1;
+  private activeUniverses: number[] = [];
   private recordingDir: string | undefined;
 
   /**
@@ -168,33 +249,34 @@ class DMXMonitorApp {
         logInfo("Starting with configuration", {
           protocol: config.protocol,
           bindAddress: config.bindAddress,
-          universe: config.selectedUniverse,
+          universes: config.allUniverses ? "all" : config.selectedUniverses,
         });
       }
 
       // Create universe manager
       this.universeManager = createUniverseManager({
-        selectedUniverse: config.selectedUniverse,
+        selectedUniverses: config.selectedUniverses,
+        allUniverses: config.allUniverses,
       });
 
       // Create protocol handler
-      this.protocolHandler = createProtocolHandler(config.protocol, config.bindAddress, config.useMulticast, config.useBroadcast, config.interfaceName, config.selectedUniverse, config.netmask);
+      this.protocolHandler = createProtocolHandler(config.protocol, config.bindAddress, config.useMulticast, config.useBroadcast, config.interfaceName, config.selectedUniverses, config.netmask);
 
       // Start protocol handler
       console.log(`\nStarting ${config.protocol.toUpperCase()} receiver...`);
       await this.protocolHandler.start();
 
       // If no universe pre-selected, handle discovery and selection
-      let selectedUniverse: number;
+      let selectedUniverses: number[];
       let bindAddress = config.bindAddress;
 
       if (this.universeManager.hasSelectedUniverse()) {
-        selectedUniverse = this.universeManager.getSelectedUniverse()!;
+        selectedUniverses = this.universeManager.getSelectedUniverses();
       } else if (config.protocol === "artnet") {
         // Run Art-Net discovery with error handling
         try {
           const discovery = await this.runArtNetDiscovery();
-          selectedUniverse = discovery.universe;
+          selectedUniverses = discovery.universes;
 
           // If user selected a node, rebind to that node's IP to receive its packets
           if (discovery.nodeIp && discovery.nodeIp !== config.bindAddress) {
@@ -207,7 +289,7 @@ class DMXMonitorApp {
                 await this.protocolHandler.stop();
 
                 // Recreate handler bound to the node's IP
-                this.protocolHandler = createProtocolHandler(config.protocol, discovery.nodeIp, config.useMulticast, config.useBroadcast, config.interfaceName, selectedUniverse, config.netmask);
+                this.protocolHandler = createProtocolHandler(config.protocol, discovery.nodeIp, config.useMulticast, config.useBroadcast, config.interfaceName, selectedUniverses, config.netmask);
                 await this.protocolHandler.start();
                 bindAddress = discovery.nodeIp;
               } catch (rebindError) {
@@ -217,7 +299,7 @@ class DMXMonitorApp {
 
                 // Restart the original handler if it was stopped
                 if (!this.protocolHandler || !(this.protocolHandler as ArtNetHandler).getDiscoveredNodes) {
-                  this.protocolHandler = createProtocolHandler(config.protocol, config.bindAddress, config.useMulticast, config.useBroadcast, config.interfaceName, selectedUniverse, config.netmask);
+                  this.protocolHandler = createProtocolHandler(config.protocol, config.bindAddress, config.useMulticast, config.useBroadcast, config.interfaceName, selectedUniverses, config.netmask);
                   await this.protocolHandler.start();
                 }
               }
@@ -227,22 +309,29 @@ class DMXMonitorApp {
           // If discovery fails completely, log the error and prompt for manual universe entry
           logError(discoveryError, "Art-Net discovery failed");
           console.log("\n⚠️  Art-Net discovery encountered an error. Please enter universe manually.\n");
-          selectedUniverse = await promptManualUniverse();
+          selectedUniverses = await promptManualUniverse();
         }
       } else {
-        // For sACN, prompt for universe (auto-detect is unreliable with multicast)
+        // For sACN, prompt for universe(s) (auto-detect is unreliable with multicast)
         console.log("\n");
-        selectedUniverse = await promptSACNUniverse();
+        selectedUniverses = await promptSACNUniverse();
       }
 
-      // If using sACN, make sure we're listening to the selected universe
+      // Remember the selection (also covers universes chosen interactively)
+      if (!config.allUniverses) {
+        this.universeManager.selectUniverses(selectedUniverses);
+      }
+
+      // If using sACN, make sure we're listening to every selected universe
       if (config.protocol === "sacn" && this.protocolHandler instanceof SACNHandler) {
-        (this.protocolHandler as SACNHandler).addUniverse(selectedUniverse);
+        for (const universe of selectedUniverses) {
+          (this.protocolHandler as SACNHandler).addUniverse(universe);
+        }
       }
 
       // Store current config for recorder
       this.currentProtocol = config.protocol;
-      this.currentUniverse = selectedUniverse;
+      this.activeUniverses = selectedUniverses;
       this.recordingDir = cliOptions.recordingDir;
 
       // Create recorder
@@ -258,10 +347,13 @@ class DMXMonitorApp {
       // Set initial stats
       this.displayManager.updateStats({
         protocol: config.protocol,
-        universe: selectedUniverse,
+        universe: selectedUniverses[0] ?? 0,
         bindAddress: bindAddress,
         interfaceName: config.interfaceName,
       });
+
+      // Make the chosen universes browsable right away ([ and ] switch universe)
+      this.displayManager.setUniverses(selectedUniverses);
 
       // Setup recording toggle callback
       this.displayManager.onRecordingToggle(() => {
@@ -269,7 +361,7 @@ class DMXMonitorApp {
       });
 
       // Setup packet handling
-      this.setupPacketHandler(selectedUniverse);
+      this.setupPacketHandler();
 
       // Start packet rate calculation
       this.startPacketRateCalculation();
@@ -279,7 +371,7 @@ class DMXMonitorApp {
 
       logInfo("DMX Monitor running", {
         protocol: config.protocol,
-        universe: selectedUniverse,
+        universes: config.allUniverses ? "all" : selectedUniverses,
         bindAddress: bindAddress,
       });
     } catch (error) {
@@ -288,10 +380,10 @@ class DMXMonitorApp {
   }
 
   /**
-   * Run Art-Net node discovery and let user select a universe
-   * Returns { universe, nodeIp } so we can rebind to the node's IP
+   * Run Art-Net node discovery and let user select universe(s)
+   * Returns { universes, nodeIp } so we can rebind to the node's IP
    */
-  private async runArtNetDiscovery(): Promise<{ universe: number; nodeIp: string | null }> {
+  private async runArtNetDiscovery(): Promise<{ universes: number[]; nodeIp: string | null }> {
     if (!(this.protocolHandler instanceof ArtNetHandler)) {
       throw new Error("Protocol handler is not an ArtNetHandler");
     }
@@ -331,7 +423,7 @@ class DMXMonitorApp {
         if (nodes.length === 0) {
           console.log("No Art-Net nodes were discovered on the network.");
           console.log("You can still monitor a specific universe manually.\n");
-          return { universe: await promptManualUniverse(), nodeIp: null };
+          return { universes: await promptManualUniverse(), nodeIp: null };
         }
 
         // Update the count for next iteration
@@ -348,29 +440,29 @@ class DMXMonitorApp {
 
         if (!selectedNode) {
           // User chose to skip node selection
-          return { universe: await promptManualUniverse(), nodeIp: null };
+          return { universes: await promptManualUniverse(), nodeIp: null };
         }
 
         // Let user select a universe from the node with error handling
         try {
-          const universeFromNode = await promptUniverseFromNode(selectedNode);
+          const universesFromNode = await promptUniverseFromNode(selectedNode);
 
-          if (universeFromNode !== null) {
-            // Validate the universe value before returning
-            if (typeof universeFromNode !== "number" || universeFromNode < 0 || universeFromNode > 32767) {
-              logWarn(`Invalid universe value from node: ${universeFromNode}`);
+          if (universesFromNode !== null) {
+            // Validate the universe values before returning
+            if (universesFromNode.length === 0 || universesFromNode.some((u) => !isValidArtNetUniverse(u))) {
+              logWarn(`Invalid universe value(s) from node: ${universesFromNode.join(", ")}`);
               console.log("\n⚠️  Invalid universe value. Please enter manually.\n");
-              return { universe: await promptManualUniverse(), nodeIp: selectedNode.ip };
+              return { universes: await promptManualUniverse(), nodeIp: selectedNode.ip };
             }
-            return { universe: universeFromNode, nodeIp: selectedNode.ip };
+            return { universes: universesFromNode, nodeIp: selectedNode.ip };
           }
 
           // Node has no universes, fall back to manual entry
-          return { universe: await promptManualUniverse(), nodeIp: selectedNode.ip };
+          return { universes: await promptManualUniverse(), nodeIp: selectedNode.ip };
         } catch (universeError) {
           logError(universeError, "Error selecting universe from node");
           console.log("\n⚠️  Error selecting universe. Please enter manually.\n");
-          return { universe: await promptManualUniverse(), nodeIp: selectedNode.ip };
+          return { universes: await promptManualUniverse(), nodeIp: selectedNode.ip };
         }
       }
     } finally {
@@ -380,34 +472,37 @@ class DMXMonitorApp {
   }
 
   /**
-   * Setup packet handler for incoming DMX data
+   * Setup packet handler for incoming DMX data (all selected universes)
    */
-  private setupPacketHandler(selectedUniverse: number): void {
+  private setupPacketHandler(): void {
     if (!this.protocolHandler || !this.displayManager || !this.universeManager) {
       return;
     }
 
-    // Log with user-facing universe display
-    const displayUniverse = formatUniverseForDisplay(selectedUniverse, this.currentProtocol);
-    logInfo(`Listening for packets on universe ${displayUniverse}`);
+    const manager = this.universeManager;
+    const listening = manager.isAllUniverses()
+      ? "all universes"
+      : `universe(s) ${this.activeUniverses.map((u) => formatUniverseForDisplay(u, this.currentProtocol)).join(", ")}`;
+    logInfo(`Listening for packets on ${listening}`);
 
     this.protocolHandler.on("packet", (packet: DMXPacket) => {
-      // Check if packet is for selected universe
-      if (packet.universe !== selectedUniverse) {
-        // Still track for universe manager
-        logDebug(`Packet filtered: got universe ${packet.universe}, want ${selectedUniverse}`);
-        this.universeManager?.updateFromPacket(packet.universe, packet.source);
+      // Track every universe we hear (for discovery/diagnostics)
+      manager.updateFromPacket(packet.universe, packet.source);
+
+      // Ignore universes we were not asked to monitor
+      if (!manager.shouldProcessPacket(packet.universe)) {
+        logDebug(`Packet filtered: got universe ${packet.universe}`);
         return;
       }
 
       // Update display
-      this.displayManager?.updateChannels(packet.channels);
+      this.displayManager?.updateChannels(packet.universe, packet.channels);
       this.displayManager?.incrementPacketCount();
       this.packetCount++;
 
       // Record frame if recording
       if (this.recorder?.isRecording()) {
-        this.recorder.recordFrame(packet.channels);
+        this.recorder.recordFrame(packet.universe, packet.channels);
         const stats = this.recorder.getStats();
         this.displayManager?.updateRecordingFrameCount(stats.frameCount);
       }
@@ -427,14 +522,15 @@ class DMXMonitorApp {
       logInfo(`New universe discovered: ${universe}`);
     });
 
-    // Handle sACN competing sources warning
+    // Handle sACN competing sources warning (per universe)
     if (this.protocolHandler instanceof SACNHandler) {
-      (this.protocolHandler as SACNHandler).on("sourcesChanged", (sources: SACNSourceInfo[]) => {
-        this.displayManager?.updateCompetingSources(sources);
+      (this.protocolHandler as SACNHandler).on("sourcesChanged", (universe: number, sources: SACNSourceInfo[]) => {
+        if (!manager.shouldProcessPacket(universe)) return;
+        this.displayManager?.updateCompetingSources(universe, sources);
         if (sources.length > 1) {
           const activeSource = sources.find((s) => s.isActive);
           const inactiveSources = sources.filter((s) => !s.isActive);
-          logWarn(`Multiple sACN sources on universe ${selectedUniverse}:`, {
+          logWarn(`Multiple sACN sources on universe ${universe}:`, {
             active: activeSource ? `${activeSource.sourceName} (pri:${activeSource.priority})` : "none",
             inactive: inactiveSources.map((s) => `${s.sourceName} (pri:${s.priority})`).join(", "),
           });
@@ -476,11 +572,12 @@ class DMXMonitorApp {
           duration: stats.duration,
           frameCount: stats.frameCount,
           bytesWritten: stats.bytesWritten,
+          universes: this.recorder.getRecordedUniverses(),
         });
       } else {
         // Start recording
         logInfo("toggleRecording: starting recording");
-        const filePath = this.recorder.startRecording(this.currentProtocol, this.currentUniverse, this.recordingDir);
+        const filePath = this.recorder.startRecording(this.currentProtocol, this.recordingDir);
         logInfo("Recording started", { filePath });
         this.displayManager?.setRecordingState("recording", new Date(), 0);
         logInfo("setRecordingState called");
@@ -565,14 +662,28 @@ class DMXMonitorApp {
       this.player = createPlayer();
       const header = this.player.load(playbackFile);
 
-      // Determine protocol and universe
-      const protocol: Protocol = cliOptions.protocol ?? (header.protocol === 0 ? "sacn" : "artnet");
-      const universe = cliOptions.universe ?? header.universe;
+      // Determine protocol and which universes go where
+      const recordedProtocol: Protocol = header.protocol === 0 ? "sacn" : "artnet";
+      const protocol: Protocol = cliOptions.protocol ?? recordedProtocol;
+      const recordedUniverses = this.player.getUniverses();
 
-      console.log(`   Protocol: ${protocol.toUpperCase()}`);
-      console.log(`   Universe: ${universe}`);
-      console.log(`   Duration: ${(header.duration / 1000).toFixed(1)}s`);
-      console.log(`   Frames: ${header.frameCount}`);
+      if (recordedUniverses.length === 0) {
+        throw new Error("Recording contains no DMX frames");
+      }
+
+      const { playUniverses, destinationOf } = resolvePlaybackUniverses(cliOptions, recordedUniverses, recordedProtocol, protocol);
+      const outputUniverses = playUniverses.map((u) => destinationOf(u));
+
+      this.player.setUniverseFilter(playUniverses);
+
+      const fmt = (u: number): string => formatUniverseForDisplay(u, protocol);
+      console.log(`   Protocol: ${protocol.toUpperCase()}${protocol !== recordedProtocol ? ` (recorded as ${recordedProtocol.toUpperCase()})` : ""}`);
+      console.log(`   Universes in file: ${recordedUniverses.map((u) => formatUniverseForDisplay(u, recordedProtocol)).join(", ")}`);
+      for (const u of playUniverses) {
+        console.log(`     ${formatUniverseForDisplay(u, recordedProtocol)} -> ${fmt(destinationOf(u))}`);
+      }
+      console.log(`   Duration: ${(this.player.getDuration() / 1000).toFixed(1)}s`);
+      console.log(`   Frames: ${this.player.getTotalFrames()}`);
 
       // Apply CLI options
       if (cliOptions.speed !== undefined) {
@@ -593,7 +704,7 @@ class DMXMonitorApp {
         console.log(`   Priority: ${priority}`);
       }
 
-      this.transmitter = createTransmitter(protocol, universe, {
+      this.transmitter = createTransmitter(protocol, outputUniverses, {
         targetAddress: cliOptions.address,
         interfaceAddress: cliOptions.address,
         priority,
@@ -614,24 +725,29 @@ class DMXMonitorApp {
       this.displayManager.updatePlaybackInfo({
         state: "idle",
         position: 0,
-        duration: header.duration,
+        duration: this.player.getDuration(),
         speed: this.player.getSpeed(),
         loopEnabled: this.player.isLoopEnabled(),
         fileName: path.basename(playbackFile),
-        universe,
+        universes: outputUniverses,
         protocol,
       });
+
+      // Show every output universe on the grid ([ and ] switch universe)
+      this.displayManager.setUniverses(outputUniverses);
 
       // Setup playback callbacks
       this.setupPlaybackCallbacks();
 
       // Setup player event handlers
-      this.player.onFrame((channels) => {
+      this.player.onFrame((recordedUniverse, channels) => {
+        const outUniverse = destinationOf(recordedUniverse);
+
         // Update display
-        this.displayManager?.updateChannels(channels);
+        this.displayManager?.updateChannels(outUniverse, channels);
 
         // Transmit DMX
-        this.transmitter?.send(channels);
+        this.transmitter?.send(outUniverse, channels);
       });
 
       this.player.onPosition((position, duration) => {
@@ -656,7 +772,7 @@ class DMXMonitorApp {
       logInfo("Playback mode running", {
         file: playbackFile,
         protocol,
-        universe,
+        universes: outputUniverses,
       });
     } catch (error) {
       await this.handleFatalError(error);
@@ -685,8 +801,7 @@ class DMXMonitorApp {
           state: "idle",
           position: 0,
         });
-        // Send blackout
-        this.transmitter?.send(new Uint8Array(512));
+        // player.stop() already emitted a zeroed frame for every universe (blackout)
       }
     });
 

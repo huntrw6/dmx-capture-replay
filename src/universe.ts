@@ -9,8 +9,10 @@ import { promptUniverseSelection } from './setup';
 
 /** Universe manager configuration */
 export interface UniverseManagerConfig {
-  /** Pre-selected universe (skip detection) */
-  selectedUniverse?: number;
+  /** Pre-selected universes (skip detection) */
+  selectedUniverses?: number[];
+  /** Accept every universe that appears */
+  allUniverses?: boolean;
   /** Detection timeout in milliseconds */
   detectionTimeout?: number;
   /** Minimum universes to detect before prompting */
@@ -27,31 +29,35 @@ const DEFAULT_MIN_UNIVERSES = 1;
 export class UniverseManager {
   private readonly config: UniverseManagerConfig;
   private readonly discoveredUniverses: Map<number, UniverseInfo> = new Map();
-  private selectedUniverse: number | null = null;
+  private selectedUniverses: Set<number> = new Set();
+  private allUniverses = false;
   private detectionPromiseResolve: ((universe: number) => void) | null = null;
 
   constructor(config: UniverseManagerConfig = {}) {
     this.config = {
       detectionTimeout: config.detectionTimeout ?? DEFAULT_DETECTION_TIMEOUT,
       minUniversesBeforePrompt: config.minUniversesBeforePrompt ?? DEFAULT_MIN_UNIVERSES,
-      selectedUniverse: config.selectedUniverse,
+      selectedUniverses: config.selectedUniverses,
     };
+    this.allUniverses = config.allUniverses ?? false;
 
-    // If universe pre-selected, validate and set it
-    if (this.config.selectedUniverse !== undefined) {
-      if (!isValidUniverse(this.config.selectedUniverse)) {
-        throw UniverseError.invalidUniverse(this.config.selectedUniverse, 0, 63999);
+    // If universes pre-selected, validate and set them
+    for (const universe of config.selectedUniverses ?? []) {
+      if (!isValidUniverse(universe)) {
+        throw UniverseError.invalidUniverse(universe, 0, 63999);
       }
-      this.selectedUniverse = this.config.selectedUniverse;
-      logInfo(`Universe pre-selected: ${this.selectedUniverse}`);
+      this.selectedUniverses.add(universe);
+    }
+    if (this.selectedUniverses.size > 0) {
+      logInfo(`Universes pre-selected: ${this.getSelectedUniverses().join(", ")}`);
     }
   }
 
   /**
-   * Get the currently selected universe
+   * Get the currently selected universes (sorted)
    */
-  getSelectedUniverse(): number | null {
-    return this.selectedUniverse;
+  getSelectedUniverses(): number[] {
+    return Array.from(this.selectedUniverses).sort((a, b) => a - b);
   }
 
   /**
@@ -62,10 +68,17 @@ export class UniverseManager {
   }
 
   /**
-   * Check if a universe is selected
+   * Check if any universe (or "all") is selected
    */
   hasSelectedUniverse(): boolean {
-    return this.selectedUniverse !== null;
+    return this.allUniverses || this.selectedUniverses.size > 0;
+  }
+
+  /**
+   * Whether every universe is accepted
+   */
+  isAllUniverses(): boolean {
+    return this.allUniverses;
   }
 
   /**
@@ -129,11 +142,12 @@ export class UniverseManager {
   /**
    * Wait for universes to be detected, then prompt for selection
    */
-  async detectAndSelectUniverse(handler: ProtocolHandler): Promise<number> {
+  async detectAndSelectUniverse(handler: ProtocolHandler): Promise<number[]> {
     // If already selected, return immediately
-    if (this.selectedUniverse !== null) {
-      logInfo(`Using pre-selected universe: ${this.selectedUniverse}`);
-      return this.selectedUniverse;
+    if (this.hasSelectedUniverse()) {
+      const list = this.getSelectedUniverses();
+      logInfo(`Using pre-selected universes: ${list.join(", ")}`);
+      return list;
     }
 
     logInfo('Detecting DMX universes...');
@@ -172,13 +186,9 @@ export class UniverseManager {
 
     // If only one universe, auto-select it
     if (universes.length === 1) {
-      const universe = universes[0];
-      if (universe === undefined) {
-        throw UniverseError.noUniversesDetected();
-      }
-      this.selectedUniverse = universe;
-      console.log(`Auto-selected universe ${this.selectedUniverse} (only one detected)`);
-      return this.selectedUniverse;
+      this.selectUniverses(universes);
+      console.log(`Auto-selected universe ${universes[0]} (only one detected)`);
+      return universes;
     }
 
     // Multiple universes - prompt for selection
@@ -189,34 +199,39 @@ export class UniverseManager {
     }
     console.log('');
 
-    this.selectedUniverse = await promptUniverseSelection(universes);
-    logInfo(`User selected universe: ${this.selectedUniverse}`);
+    const chosen = await promptUniverseSelection(universes);
+    this.selectUniverses(chosen);
+    logInfo(`User selected universes: ${chosen.join(", ")}`);
 
-    return this.selectedUniverse;
+    return chosen;
   }
 
   /**
-   * Manually select a universe
+   * Manually select universes (replaces the current selection)
    */
-  selectUniverse(universe: number): void {
-    if (!isValidUniverse(universe)) {
-      throw UniverseError.invalidUniverse(universe, 0, 63999);
+  selectUniverses(universes: number[]): void {
+    for (const universe of universes) {
+      if (!isValidUniverse(universe)) {
+        throw UniverseError.invalidUniverse(universe, 0, 63999);
+      }
     }
-
-    this.selectedUniverse = universe;
-    logInfo(`Universe manually selected: ${universe}`);
+    this.selectedUniverses = new Set(universes);
+    this.allUniverses = false;
+    logInfo(`Universes manually selected: ${this.getSelectedUniverses().join(", ")}`);
   }
 
   /**
-   * Check if a packet should be processed (matches selected universe)
+   * Check if a packet should be processed (matches the selected universes)
    */
   shouldProcessPacket(universe: number): boolean {
-    // If no universe selected yet, process all (for discovery)
-    if (this.selectedUniverse === null) {
+    // Nothing selected yet: process all (for discovery)
+    if (!this.hasSelectedUniverse()) {
       return true;
     }
-
-    return universe === this.selectedUniverse;
+    if (this.allUniverses) {
+      return true;
+    }
+    return this.selectedUniverses.has(universe);
   }
 
   /**
@@ -232,7 +247,7 @@ export class UniverseManager {
    */
   getStats(): {
     totalUniverses: number;
-    selectedUniverse: number | null;
+    selectedUniverses: number[];
     universes: Array<{
       universe: number;
       packetCount: number;
@@ -242,7 +257,7 @@ export class UniverseManager {
   } {
     return {
       totalUniverses: this.discoveredUniverses.size,
-      selectedUniverse: this.selectedUniverse,
+      selectedUniverses: this.getSelectedUniverses(),
       universes: Array.from(this.discoveredUniverses.values()).map(info => ({
         universe: info.universe,
         packetCount: info.packetCount,
