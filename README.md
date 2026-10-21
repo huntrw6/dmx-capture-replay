@@ -1,6 +1,6 @@
 # DMX Monitor
 
-Monitor, record, and play back sACN and Art-Net. Supports many universes at once.
+Monitor, record, and play back sACN and Art-Net with as many universes as you want.
 
 ## Setup
 
@@ -59,4 +59,4 @@ node dist/index.js --playback rec.dmxrec --map 1=11,2=12
 
 ## License
 
-[GPL-3.0](LICENCE). Dependencies are MIT or Apache-2.0, which are compatible.
+[GPL-3.0](LICENCE). Dependencies are MIT or Apache-2.0.
